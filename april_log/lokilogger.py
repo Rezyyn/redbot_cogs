@@ -1,7 +1,7 @@
 import aiohttp
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from redbot.core import commands, Config
 import discord
 
@@ -41,7 +41,7 @@ class LokiHelper:
                 "name": message.author.name,
                 "discriminator": message.author.discriminator,
                 "bot": message.author.bot,
-                "avatar": str(message.author.avatar.url) if message.author.avatar else None
+                "avatar": str(message.author.avatar.url) if message.author.avatar and message.author.avatar.url else None
             },
             "channel": {
                 "id": str(message.channel.id),
@@ -73,10 +73,84 @@ class LokiHelper:
             "guild_id": str(message.guild.id) if message.guild else "DM"
         }
         
-        return await self._send_to_loki(stream, [[ns_timestamp, json.dumps(message_data)]])
+        return await self._send_to_loki(stream, [[ns_timestamp, json.dumps(message_data)]]
     
-    # Similar methods for log_edit, log_delete, log_reaction would go here
-    # (Full implementations omitted for brevity but follow same pattern)
+    async def log_edit(self, before, after):
+        """Log message edits"""
+        ns_timestamp = str(int(time.time() * 1e9))
+        
+        edit_data = {
+            "event_type": "edit",
+            "message_id": str(after.id),
+            "channel_id": str(after.channel.id),
+            "guild_id": str(after.guild.id) if after.guild else "DM",
+            "author_id": str(after.author.id),
+            "old_content": before.content,
+            "new_content": after.content,
+            "edited_at": after.edited_at.isoformat() if after.edited_at else None
+        }
+        
+        stream = {
+            "app": "discord-bot",
+            "event_type": "edit",
+            "channel_id": str(after.channel.id),
+            "guild_id": str(after.guild.id) if after.guild else "DM"
+        }
+        
+        return await self._send_to_loki(stream, [[ns_timestamp, json.dumps(edit_data)]])
+    
+    async def log_delete(self, message):
+        """Log message deletions"""
+        ns_timestamp = str(int(time.time() * 1e9))
+        
+        delete_data = {
+            "event_type": "delete",
+            "message_id": str(message.id),
+            "channel_id": str(message.channel.id),
+            "guild_id": str(message.guild.id) if message.guild else "DM",
+            "author_id": str(message.author.id),
+            "content": message.content,
+            "created_at": message.created_at.isoformat(),
+            "deleted_at": datetime.now(timezone.utc).isoformat()
+        }
+        
+        stream = {
+            "app": "discord-bot",
+            "event_type": "delete",
+            "channel_id": str(message.channel.id),
+            "guild_id": str(message.guild.id) if message.guild else "DM"
+        }
+        
+        return await self._send_to_loki(stream, [[ns_timestamp, json.dumps(delete_data)]])
+    
+    async def log_reaction(self, reaction, user, action_type):
+        """Log reaction add/remove"""
+        ns_timestamp = str(int(time.time() * 1e9))
+        
+        reaction_data = {
+            "event_type": action_type,
+            "message_id": str(reaction.message.id),
+            "channel_id": str(reaction.message.channel.id),
+            "guild_id": str(reaction.message.guild.id) if reaction.message.guild else "DM",
+            "user": {
+                "id": str(user.id),
+                "name": user.name
+            },
+            "emoji": {
+                "name": reaction.emoji.name,
+                "id": str(reaction.emoji.id) if hasattr(reaction.emoji, 'id') else None,
+                "custom": isinstance(reaction.emoji, discord.Emoji)
+            }
+        }
+        
+        stream = {
+            "app": "discord-bot",
+            "event_type": "reaction",
+            "channel_id": str(reaction.message.channel.id),
+            "guild_id": str(reaction.message.guild.id) if reaction.message.guild else "DM"
+        }
+        
+        return await self._send_to_loki(stream, [[ns_timestamp, json.dumps(reaction_data)]])
 
 class LokiLogger(commands.Cog):
     """Logs Discord events to Grafana Loki"""
@@ -108,9 +182,49 @@ class LokiLogger(commands.Cog):
         if helper:
             await helper.log_message(message)
     
-    # Similar listeners for:
-    # on_message_edit, on_message_delete, on_reaction_add, on_reaction_remove
-    # (Implement following same pattern as on_message)
+    @commands.Cog.listener()
+    async def on_message_edit(self, before, after):
+        if before.content == after.content or after.author.bot:
+            return
+        if not await self.config.enabled():
+            return
+            
+        helper = await self.get_loki_helper()
+        if helper:
+            await helper.log_edit(before, after)
+
+    @commands.Cog.listener()
+    async def on_message_delete(self, message):
+        if message.author.bot:
+            return
+        if not await self.config.enabled():
+            return
+            
+        helper = await self.get_loki_helper()
+        if helper:
+            await helper.log_delete(message)
+
+    @commands.Cog.listener()
+    async def on_reaction_add(self, reaction, user):
+        if user.bot:
+            return
+        if not await self.config.enabled():
+            return
+            
+        helper = await self.get_loki_helper()
+        if helper:
+            await helper.log_reaction(reaction, user, "reaction_add")
+
+    @commands.Cog.listener()
+    async def on_reaction_remove(self, reaction, user):
+        if user.bot:
+            return
+        if not await self.config.enabled():
+            return
+            
+        helper = await self.get_loki_helper()
+        if helper:
+            await helper.log_reaction(reaction, user, "reaction_remove")
     
     @commands.group()
     @commands.is_owner()
@@ -147,9 +261,21 @@ class LokiLogger(commands.Cog):
         if not helper:
             return await ctx.send("❌ Loki URL not configured!")
         
-        test_message = type('Obj', (object,), {'content': 'Test', 'id': '123', 'author': ctx.author,
-                                              'channel': ctx.channel, 'guild': ctx.guild,
-                                              'attachments': [], 'embeds': []})
+        # Create a proper test message object
+        class TestMessage:
+            def __init__(self, real_message):
+                self.content = "Loki Logger Test Message"
+                self.id = 123456789
+                self.author = real_message.author
+                self.channel = real_message.channel
+                self.guild = real_message.guild
+                self.created_at = real_message.created_at
+                self.attachments = []
+                self.embeds = []
+                self.reactions = []
+                self.reference = None
+        
+        test_message = TestMessage(ctx.message)
         result = await helper.log_message(test_message)
         if "Success" in result:
             await ctx.send("✅ Connection successful!")
