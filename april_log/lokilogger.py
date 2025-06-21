@@ -73,7 +73,7 @@ class LokiHelper:
             "guild_id": str(message.guild.id) if message.guild else "DM"
         }
         
-        return await self._send_to_loki(stream, [[ns_timestamp, json.dumps(message_data)]]
+        return await self._send_to_loki(stream, [[ns_timestamp, json.dumps(message_data)]])
     
     async def log_edit(self, before, after):
         """Log message edits"""
@@ -263,19 +263,48 @@ class LokiLogger(commands.Cog):
         
         # Create a proper test message object
         class TestMessage:
-            def __init__(self, real_message):
-                self.content = "Loki Logger Test Message"
-                self.id = 123456789
-                self.author = real_message.author
-                self.channel = real_message.channel
-                self.guild = real_message.guild
-                self.created_at = real_message.created_at
-                self.attachments = []
-                self.embeds = []
-                self.reactions = []
-                self.reference = None
+            content = "Loki Logger Test Message"
+            id = 123456789
+            
+            class Author:
+                id = 987654321
+                name = "TestUser"
+                discriminator = "0001"
+                bot = False
+                avatar = None
+                
+                class Avatar:
+                    url = "https://example.com/avatar.png"
+                
+                @property
+                def avatar(self):
+                    return self.Avatar() if hasattr(self, 'Avatar') else None
+                    
+            author = Author()
+            created_at = datetime.now(timezone.utc)
+            
+            class Channel:
+                id = 1122334455
+                name = "test-channel"
+                
+                class Category:
+                    name = "Test Category"
+                
+                @property
+                def category(self):
+                    return self.Category()
+            
+            channel = Channel()
+            
+            class Guild:
+                id = 5544332211
+                name = "Test Guild"
+            
+            guild = Guild()
+            attachments = []
+            embeds = []
         
-        test_message = TestMessage(ctx.message)
+        test_message = TestMessage()
         result = await helper.log_message(test_message)
         if "Success" in result:
             await ctx.send("✅ Connection successful!")
