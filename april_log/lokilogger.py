@@ -254,7 +254,7 @@ class LokiLogger(commands.Cog):
         status = "ENABLED" if not current else "DISABLED"
         await ctx.send(f"✅ Logging {status}")
 
-@lokiset.command()
+    @lokiset.command()
     async def test(self, ctx):
         """Test Loki connection"""
         helper = await self.get_loki_helper()
@@ -263,54 +263,24 @@ class LokiLogger(commands.Cog):
         
         # Create a proper test message object
         class TestMessage:
-            content = "Loki Logger Test Message"
-            id = 123456789
-            
-            class Author:
-                id = 987654321
-                name = "TestUser"
-                discriminator = "0001"
-                bot = False
-                avatar = None
-                
-                class Avatar:
-                    url = "https://example.com/avatar.png"
-                
-                @property
-                def avatar(self):
-                    return self.Avatar() if hasattr(self, 'Avatar') else None
-                    
-            author = Author()
-            created_at = datetime.now(timezone.utc)
-            
-            class Channel:
-                id = 1122334455
-                name = "test-channel"
-                
-                class Category:
-                    name = "Test Category"
-                
-                @property
-                def category(self):
-                    return self.Category()
-            
-            channel = Channel()
-            
-            class Guild:
-                id = 5544332211
-                name = "Test Guild"
-            
-            guild = Guild()
-            attachments = []
-            embeds = []
+            def __init__(self, real_message):
+                self.content = "Loki Logger Test Message"
+                self.id = 123456789
+                self.author = real_message.author
+                self.channel = real_message.channel
+                self.guild = real_message.guild
+                self.created_at = real_message.created_at
+                self.attachments = []
+                self.embeds = []
+                self.reactions = []
+                self.reference = None
         
-        test_message = TestMessage()
+        test_message = TestMessage(ctx.message)
         result = await helper.log_message(test_message)
         if "Success" in result:
             await ctx.send("✅ Connection successful!")
         else:
             await ctx.send(f"❌ Error: {result}")
-
     
     @lokiset.command()
     async def settings(self, ctx):
