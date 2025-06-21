@@ -254,33 +254,31 @@ class LokiLogger(commands.Cog):
         status = "ENABLED" if not current else "DISABLED"
         await ctx.send(f"✅ Logging {status}")
 
-    @lokiset.command()
-    async def test(self, ctx):
-        """Test Loki connection"""
-        helper = await self.get_loki_helper()
-        if not helper:
-            return await ctx.send("❌ Loki URL not configured!")
-        
-        # Create a proper test message object
-        class TestMessage:
-            def __init__(self, real_message):
-                self.content = "Loki Logger Test Message"
-                self.id = 123456789
-                self.author = real_message.author
-                self.channel = real_message.channel
-                self.guild = real_message.guild
-                self.created_at = real_message.created_at
-                self.attachments = []
-                self.embeds = []
-                self.reactions = []
-                self.reference = None
-        
-        test_message = TestMessage(ctx.message)
-        result = await helper.log_message(test_message)
-        if "Success" in result:
-            await ctx.send("✅ Connection successful!")
-        else:
-            await ctx.send(f"❌ Error: {result}")
+@lokiset.command()
+async def test(self, ctx):
+    """Test Loki connection"""
+    helper = await self.get_loki_helper()
+    if not helper:
+        return await ctx.send("❌ Loki URL not configured!")
+
+    class TestMessage:
+        def __init__(self, ctx):
+            self.content = "Loki Logger Test Message"
+            self.id = 123456789
+            self.author = ctx.author
+            self.channel = ctx.channel
+            self.guild = ctx.guild
+            self.created_at = datetime.now(timezone.utc)
+            self.attachments = []
+            self.embeds = []
+
+    test_message = TestMessage(ctx)
+    result = await helper.log_message(test_message)
+    if "Success" in result:
+        await ctx.send("✅ Connection successful!")
+    else:
+        await ctx.send(f"❌ Error: {result}")
+
     
     @lokiset.command()
     async def settings(self, ctx):
