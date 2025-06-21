@@ -1,0 +1,10 @@
+{
+    "name": "Magic8Ball",
+    "author": "Your Name",
+    "short": "Classic fortune-telling toy",
+    "description": "Ask the magic 8-ball a yes/no question and get a mysterious answer",
+    "install_msg": "🎱 The magic 8-ball is ready! Ask your questions with `[p]8ball`",
+    "tags": ["fun", "game", "fortune"],
+    "requirements": [],
+    "end_user_data_statement": "This cog does not store user data."
+}

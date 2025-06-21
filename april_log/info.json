@@ -1,0 +1,10 @@
+{
+    "name": "LokiLogger",
+    "author": "Your Name",
+    "short": "Logs Discord events to Loki",
+    "description": "Comprehensive logging of messages, edits, deletions, and reactions to Grafana Loki",
+    "install_msg": "⚠️ Configure Loki URL first with `[p]lokiset url`!",
+    "tags": ["logging", "monitoring", "loki"],
+    "requirements": ["aiohttp"],
+    "end_user_data_statement": "This cog logs message content and user information to an external Loki instance."
+}
