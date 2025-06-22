@@ -1,0 +1,11 @@
+{
+  "author": "Rezyn",
+  "description": "Backfill all Discord guild channels with historic messages to Grafana Loki.",
+  "install_msg": "Backfill cog loaded. Use [p]lokibackfillall [limit] to start backfilling all channels to Loki.",
+  "name": "LokiBackfill",
+  "short": "Backfill messages to Loki",
+  "requirements": [],
+  "tags": ["logging", "loki", "discord", "backfill"],
+  "type": "COG",
+  "end_user_data_statement": "This cog reads message history and exports it to a configured Loki endpoint. No data is stored locally."
+}
