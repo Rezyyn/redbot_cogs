@@ -26,11 +26,22 @@ class AprilAI(commands.Cog):
         self.config.register_global(**default_global)
         self.voice_clients = {}
         self.active_tts_tasks = {}
+        self.nacl_available = True  # Assume available until proven otherwise
 
     def cog_unload(self):
         self.bot.loop.create_task(self.session.close())
-        for vc in self.voice_clients.values():
+        for guild_id, vc in list(self.voice_clients.items()):
             self.bot.loop.create_task(vc.disconnect(force=True))
+            del self.voice_clients[guild_id]
+
+    async def check_nacl(self):
+        """Check if PyNaCl is installed for voice support"""
+        try:
+            import nacl
+            self.nacl_available = True
+        except ImportError:
+            self.nacl_available = False
+        return self.nacl_available
 
     @commands.group(name="april", invoke_without_command=True)
     @commands.cooldown(1, 15, commands.BucketType.user)
@@ -70,6 +81,14 @@ class AprilAI(commands.Cog):
 
     async def join_voice(self, ctx):
         """Join the user's voice channel"""
+        # Check if PyNaCl is installed
+        if not await self.check_nacl():
+            return await ctx.send(
+                "❌ **PyNaCl library required for voice!**\n"
+                "Bot owner must install it with:\n"
+                "```[p]pipinstall pynacl```"
+            )
+            
         if not ctx.guild:
             return await ctx.send("❌ This command only works in servers!")
         
@@ -95,18 +114,25 @@ class AprilAI(commands.Cog):
             vc = await voice_channel.connect()
             self.voice_clients[ctx.guild.id] = vc
             await ctx.send(f"🔊 Joined {voice_channel.name}")
-        except discord.ClientException:
-            # Try to reconnect if already connected elsewhere
-            if ctx.guild.voice_client:
-                await ctx.guild.voice_client.disconnect(force=True)
-                vc = await voice_channel.connect()
-                self.voice_clients[ctx.guild.id] = vc
-                await ctx.send(f"🔊 Reconnected to {voice_channel.name}")
+        except discord.ClientException as e:
+            if "PyNaCl library needed" in str(e):
+                self.nacl_available = False
+                await ctx.send(
+                    "❌ **PyNaCl library required for voice!**\n"
+                    "Bot owner must install it with:\n"
+                    "```[p]pipinstall pynacl```"
+                )
+            else:
+                await ctx.send(f"❌ Failed to join voice: {str(e)}")
         except Exception as e:
             await ctx.send(f"❌ Failed to join voice: {str(e)}")
 
     async def speak_response(self, guild, text: str):
         """Convert text to speech using ElevenLabs"""
+        # Skip if PyNaCl not available
+        if not self.nacl_available:
+            return
+            
         tts_key = await self.config.tts_key()
         voice_id = await self.config.voice_id()
         vc = self.voice_clients.get(guild.id)
@@ -232,6 +258,7 @@ class AprilAI(commands.Cog):
         embed.add_field(name="Voice ID", value=config['voice_id'])
         embed.add_field(name="TTS Enabled", value=("✅" if config['tts_enabled'] else "❌"))
         embed.add_field(name="Text w/Voice", value=("✅" if config['text_response_when_voice'] else "❌"))
+        embed.add_field(name="PyNaCl Installed", value=("✅" if self.nacl_available else "❌"))
         
         # AI settings
         embed.add_field(name="Model", value=config['model'])
