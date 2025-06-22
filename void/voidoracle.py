@@ -20,25 +20,31 @@ class VoidOracle(commands.Cog):
             "The universe is a cold, uncaring mother.  It will eventually reclaim you.",
             "You are a collection of stardust briefly arranged into a vaguely sentient shape.",
             "Happiness is just a chemical trick your brain plays to keep you reproducing.",
-            "Everything you love will eventually decay.  Enjoy it while it lasts... or don't."
+            "Everything you love will eventually decay.  Enjoy it while it lasts... or don't.",
+            "The void remembers your darkest secrets.  It's always watching.",
+            "Your soul is a putrid carcass, rotting in the cosmic abyss.",
         ]
-        
+
         # Level 2: really fucked
         self.level2_responses = [
-            "The void remembers all your embarrassing moments. It judges you harshly.",
-            "Free will is an illusion. You are merely a puppet dancing to the tune of entropy.",
+            "The void whispers in your ear, taunting you with your insignificance.",
+            "Free will is an illusion.  You are merely a pawn in the cosmic game.",
             "Your consciousness is a fragile bubble, easily burst by the slightest inconvenience.",
             "The meaning of life?  To delay the inevitable heat death of the universe, obviously.",
-            "You are a cosmic accident, destined to be forgotten.  Embrace the nihilism."
+            "You are a cosmic accident, destined to be forgotten.  Embrace the nihilism.",
+            "The void has seen your deepest fears.  It finds them amusing.",
+            "You are a meatbag piloting a fragile skeleton, hurtling through the void.  Don't overthink it.",
         ]
-        
-        # Level 3: level 3 nsfw unhinged responses, no holds barred 
+
+        # Level 3: level 3 nsfw unhinged responses, no holds barred
         self.level3_responses = [
-            "The void has seen things... things you wouldn't believe.  Mostly regret and lukewarm coffee.",
+            "The void has seen things... things you wouldn't believe.  Mostly regret and your own reflection.",
             "Your soul is a particularly pungent cheese, slowly ripening in the cosmic fridge.",
             "Love is just a desperate attempt to avoid the crushing loneliness of existence.  Good luck with that.",
             "The universe is actively mocking your attempts at self-improvement.",
-            "You are a meatbag piloting a fragile skeleton, hurtling through the void.  Don't overthink it."
+            "You are a meat puppet, dancing to the tune of entropy.",
+            "The void has a dark sense of humor.  It finds your suffering entertaining.",
+            "You are a fleeting spark in the vast, empty void.  Enjoy the ride.",
         ]
 
     @commands.command(name="void", aliases=["askthevoid", "oracle"])
