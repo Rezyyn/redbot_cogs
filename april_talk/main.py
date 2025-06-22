@@ -30,7 +30,7 @@ class AprilAI(commands.Cog):
     def cog_unload(self):
         self.bot.loop.create_task(self.session.close())
         for vc in self.voice_clients.values():
-            self.bot.loop.create_task(vc.disconnect())
+            self.bot.loop.create_task(vc.disconnect(force=True))
 
     @commands.group(name="april", invoke_without_command=True)
     @commands.cooldown(1, 15, commands.BucketType.user)
@@ -70,17 +70,40 @@ class AprilAI(commands.Cog):
 
     async def join_voice(self, ctx):
         """Join the user's voice channel"""
+        if not ctx.guild:
+            return await ctx.send("❌ This command only works in servers!")
+        
         if not ctx.author.voice or not ctx.author.voice.channel:
             return await ctx.send("❌ You need to be in a voice channel!")
         
         # Join voice channel
         voice_channel = ctx.author.voice.channel
+        
+        # Check if already connected to this voice channel
+        if ctx.guild.id in self.voice_clients:
+            vc = self.voice_clients[ctx.guild.id]
+            if vc.channel.id == voice_channel.id:
+                return await ctx.send("✅ Already in your voice channel")
+            # Move to new channel if needed
+            try:
+                await vc.move_to(voice_channel)
+                return await ctx.send(f"🔊 Moved to {voice_channel.name}")
+            except discord.ClientException:
+                pass
+        
         try:
             vc = await voice_channel.connect()
             self.voice_clients[ctx.guild.id] = vc
             await ctx.send(f"🔊 Joined {voice_channel.name}")
         except discord.ClientException:
-            await ctx.send("✅ Already in your voice channel")
+            # Try to reconnect if already connected elsewhere
+            if ctx.guild.voice_client:
+                await ctx.guild.voice_client.disconnect(force=True)
+                vc = await voice_channel.connect()
+                self.voice_clients[ctx.guild.id] = vc
+                await ctx.send(f"🔊 Reconnected to {voice_channel.name}")
+        except Exception as e:
+            await ctx.send(f"❌ Failed to join voice: {str(e)}")
 
     async def speak_response(self, guild, text: str):
         """Convert text to speech using ElevenLabs"""
@@ -93,7 +116,10 @@ class AprilAI(commands.Cog):
         
         # Cancel any ongoing TTS task
         if guild.id in self.active_tts_tasks:
-            self.active_tts_tasks[guild.id].cancel()
+            try:
+                self.active_tts_tasks[guild.id].cancel()
+            except:
+                pass
         
         # Create new TTS task
         self.active_tts_tasks[guild.id] = asyncio.create_task(
@@ -122,26 +148,33 @@ class AprilAI(commands.Cog):
                 }
             }
             
-            # Get TTS audio
-            async with self.session.post(
-                f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
-                json=payload,
-                headers=headers
-            ) as response:
-                if response.status == 200:
-                    # Create in-memory audio source
-                    audio_data = await response.read()
-                    source = discord.FFmpegPCMAudio(
-                        source="pipe:0", 
-                        before_options="-f mp3",
-                        options="-loglevel warning",
-                        pipe=True
-                    )
-                    
-                    # Play audio
-                    vc.play(source)
-                    while vc.is_playing():
-                        await asyncio.sleep(0.1)
+            try:
+                # Get TTS audio
+                async with self.session.post(
+                    f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
+                    json=payload,
+                    headers=headers,
+                    timeout=30
+                ) as response:
+                    if response.status == 200:
+                        # Create in-memory audio source
+                        audio_data = await response.read()
+                        source = discord.FFmpegPCMAudio(
+                            source="pipe:0", 
+                            before_options="-f mp3",
+                            options="-loglevel warning",
+                            pipe=True
+                        )
+                        
+                        # Play audio
+                        vc.play(source)
+                        while vc.is_playing():
+                            await asyncio.sleep(0.1)
+                    else:
+                        error = await response.text()
+                        print(f"ElevenLabs API error: {error}")
+            except Exception as e:
+                print(f"TTS playback error: {str(e)}")
 
     @commands.group(name="deepseek", aliases=["ds"])
     @commands.is_owner()
@@ -248,9 +281,25 @@ class AprilAI(commands.Cog):
     @april.command()
     async def leave(self, ctx):
         """Leave voice channel"""
+        if not ctx.guild:
+            return await ctx.send("❌ This command only works in servers!")
+            
         if ctx.guild.id in self.voice_clients:
-            await self.voice_clients[ctx.guild.id].disconnect()
+            vc = self.voice_clients[ctx.guild.id]
+            await vc.disconnect(force=True)
             del self.voice_clients[ctx.guild.id]
+            
+            # Cancel any active TTS task
+            if ctx.guild.id in self.active_tts_tasks:
+                try:
+                    self.active_tts_tasks[ctx.guild.id].cancel()
+                except:
+                    pass
+                del self.active_tts_tasks[ctx.guild.id]
+                
+            await ctx.send("👋 Left voice channel")
+        elif ctx.guild.voice_client:
+            await ctx.guild.voice_client.disconnect(force=True)
             await ctx.send("👋 Left voice channel")
         else:
             await ctx.send("❌ Not in a voice channel")
@@ -314,11 +363,15 @@ class AprilAI(commands.Cog):
         guild_id = member.guild.id
         if guild_id in self.voice_clients:
             vc = self.voice_clients[guild_id]
-            if len(vc.channel.members) == 1:  # Only bot remains
-                await vc.disconnect()
+            # Ensure we're still in a channel
+            if vc.channel and len(vc.channel.members) == 1:  # Only bot remains
+                await vc.disconnect(force=True)
                 del self.voice_clients[guild_id]
                 if guild_id in self.active_tts_tasks:
-                    self.active_tts_tasks[guild_id].cancel()
+                    try:
+                        self.active_tts_tasks[guild_id].cancel()
+                    except:
+                        pass
                     del self.active_tts_tasks[guild_id]
 
 async def setup(bot):
