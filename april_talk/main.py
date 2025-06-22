@@ -114,7 +114,52 @@ class AprilAI(commands.Cog):
             self.play_tts(voice_client, tts_key, voice_id, text)
         )
 
-    async def play_tts(self, voice_client, tts_key, voice_id, text: str):
+   async def play_tts(self, voice_client, tts_key, voice_id, text: str):
+    """Play TTS audio in voice channel from ElevenLabs (MP3)"""
+    # Split long text into chunks
+    chunks = [text[i:i+2000] for i in range(0, len(text), 2000)]
+    
+    for chunk in chunks:
+        if not chunk.strip():
+            continue
+
+        headers = {
+            "xi-api-key": tts_key,
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "text": chunk,
+            "voice_settings": {
+                "stability": 0.5,
+                "similarity_boost": 0.8
+            }
+        }
+        try:
+            async with self.session.post(
+                f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
+                json=payload,
+                headers=headers,
+                timeout=30
+            ) as response:
+                if response.status == 200:
+                    audio_data = await response.read()
+                    audio_stream = io.BytesIO(audio_data)
+                    # Play audio from in-memory stream
+                    source = discord.FFmpegPCMAudio(
+                        audio_stream,
+                        pipe=True,
+                        before_options="-f mp3",
+                        options="-loglevel warning"
+                    )
+                    if not voice_client.is_playing():
+                        voice_client.play(source)
+                        while voice_client.is_playing():
+                            await asyncio.sleep(0.1)
+                else:
+                    error = await response.text()
+                    print(f"ElevenLabs API error: {error}")
+        except Exception as e:
+            print(f"TTS playback error: {str(e)}")
         """Play TTS audio in voice channel"""
         # Split long text into chunks
         chunks = [text[i:i+2000] for i in range(0, len(text), 2000)]
