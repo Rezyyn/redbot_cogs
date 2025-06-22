@@ -1,6 +1,7 @@
 import aiohttp
 import json
 import math
+import time  # Added missing import
 from datetime import datetime, timedelta
 import dateparser
 import discord
@@ -41,7 +42,7 @@ class ReactionStats(commands.Cog):
         start_ns = end_ns - int(hours * 3600 * 1e9)
         
         # Build query URL
-        query_url = f"{loki_url}?query={query}&start={start_ns}&end={end_ns}&limit=1000"
+        query_url = f"{loki_url.rstrip('/')}/loki/api/v1/query_range?query={query}&start={start_ns}&end={end_ns}&limit=1000"
         
         headers = {"Content-Type": "application/json"}
         if auth_token:
