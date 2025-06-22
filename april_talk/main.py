@@ -3,7 +3,8 @@ import aiohttp
 import discord
 from redbot.core import commands, Config
 from redbot.core.bot import Red
-import sys
+from redbot.core.utils.chat_formatting import pagify
+from redbot.core.utils.menus import close_menu, menu, DEFAULT_CONTROLS
 
 class AprilAI(commands.Cog):
     """Unified AI assistant with text and voice capabilities"""
@@ -25,33 +26,13 @@ class AprilAI(commands.Cog):
             "text_response_when_voice": True
         }
         self.config.register_global(**default_global)
-        self.voice_clients = {}
         self.active_tts_tasks = {}
-        
-        # Enhanced PyNaCl detection
-        self.nacl_available = self.check_nacl()
-        if not self.nacl_available:
-            print("PyNaCl not found - voice features disabled")
-
-    def check_nacl(self):
-        """Robust PyNaCl availability check"""
-        try:
-            import nacl
-            # Verify we have the correct version Discord requires
-            if not hasattr(nacl, '__version__') or not nacl.__version__:
-                return False
-            # Try to use a function that requires voice support
-            discord.opus.load_opus('libopus.so.0')
-            return True
-        except Exception as e:
-            print(f"PyNaCl check failed: {str(e)}")
-            return False
+        self.voice_lock = asyncio.Lock()
 
     def cog_unload(self):
         self.bot.loop.create_task(self.session.close())
-        for guild_id, vc in list(self.voice_clients.items()):
-            self.bot.loop.create_task(vc.disconnect(force=True))
-            del self.voice_clients[guild_id]
+        for task in self.active_tts_tasks.values():
+            task.cancel()
 
     @commands.group(name="april", invoke_without_command=True)
     @commands.cooldown(1, 15, commands.BucketType.user)
@@ -67,7 +48,7 @@ class AprilAI(commands.Cog):
     async def process_query(self, ctx, input_text):
         """Process user input with dual text/voice response"""
         # Check if we should use voice response
-        use_voice = await self.config.tts_enabled() and ctx.guild and self.nacl_available
+        use_voice = await self.config.tts_enabled() and ctx.guild and ctx.guild.voice_client
         
         async with ctx.typing():
             try:
@@ -91,69 +72,34 @@ class AprilAI(commands.Cog):
 
     async def join_voice(self, ctx):
         """Join the user's voice channel"""
-        # Re-check PyNaCl on each join attempt
-        if not self.nacl_available:
-            self.nacl_available = self.check_nacl()
-            
-        if not self.nacl_available:
-            return await ctx.send(
-                "❌ **PyNaCl not functioning properly!**\n"
-                "Try reinstalling:\n"
-                "```[p]pipinstall --force-reinstall pynacl```\n"
-                "Then reload this cog with `[p]reload april_talk`"
-            )
-            
         if not ctx.guild:
             return await ctx.send("❌ This command only works in servers!")
         
         if not ctx.author.voice or not ctx.author.voice.channel:
             return await ctx.send("❌ You need to be in a voice channel!")
         
-        # Join voice channel
-        voice_channel = ctx.author.voice.channel
-        
-        # Check if already connected to this voice channel
-        if ctx.guild.id in self.voice_clients:
-            vc = self.voice_clients[ctx.guild.id]
-            if vc.channel.id == voice_channel.id:
-                return await ctx.send("✅ Already in your voice channel")
-            # Move to new channel if needed
-            try:
-                await vc.move_to(voice_channel)
-                return await ctx.send(f"🔊 Moved to {voice_channel.name}")
-            except discord.ClientException:
-                pass
-        
+        # Join voice channel using Red's standard method
         try:
-            # Try with reconnect=True
-            vc = await voice_channel.connect(reconnect=True)
-            self.voice_clients[ctx.guild.id] = vc
-            await ctx.send(f"🔊 Joined {voice_channel.name}")
-        except discord.ClientException as e:
-            if "PyNaCl library needed" in str(e):
-                self.nacl_available = False
-                await ctx.send(
-                    "❌ **PyNaCl library required for voice!**\n"
-                    "Bot owner must install it with:\n"
-                    "```[p]pipinstall --force-reinstall pynacl```\n"
-                    "Then reload this cog with `[p]reload april_talk`"
-                )
+            # Get existing voice client or create new one
+            voice_client = ctx.guild.voice_client
+            if not voice_client:
+                voice_client = await ctx.author.voice.channel.connect()
+                await ctx.send(f"🔊 Joined {ctx.author.voice.channel.name}")
+            elif voice_client.channel != ctx.author.voice.channel:
+                await voice_client.move_to(ctx.author.voice.channel)
+                await ctx.send(f"🔊 Moved to {ctx.author.voice.channel.name}")
             else:
-                await ctx.send(f"❌ Failed to join voice: {str(e)}")
+                await ctx.send("✅ Already in your voice channel")
         except Exception as e:
             await ctx.send(f"❌ Failed to join voice: {str(e)}")
 
     async def speak_response(self, guild, text: str):
         """Convert text to speech using ElevenLabs"""
-        # Skip if PyNaCl not available
-        if not self.nacl_available:
-            return
-            
         tts_key = await self.config.tts_key()
         voice_id = await self.config.voice_id()
-        vc = self.voice_clients.get(guild.id)
+        voice_client = guild.voice_client
         
-        if not vc or not tts_key:
+        if not voice_client or not tts_key:
             return
         
         # Cancel any ongoing TTS task
@@ -165,10 +111,10 @@ class AprilAI(commands.Cog):
         
         # Create new TTS task
         self.active_tts_tasks[guild.id] = asyncio.create_task(
-            self.play_tts(vc, tts_key, voice_id, text)
+            self.play_tts(voice_client, tts_key, voice_id, text)
         )
 
-    async def play_tts(self, vc, tts_key, voice_id, text: str):
+    async def play_tts(self, voice_client, tts_key, voice_id, text: str):
         """Play TTS audio in voice channel"""
         # Split long text into chunks
         chunks = [text[i:i+2000] for i in range(0, len(text), 2000)]
@@ -201,6 +147,8 @@ class AprilAI(commands.Cog):
                     if response.status == 200:
                         # Create in-memory audio source
                         audio_data = await response.read()
+                        
+                        # Use Red's audio source creation
                         source = discord.FFmpegPCMAudio(
                             source="pipe:0", 
                             before_options="-f mp3",
@@ -208,9 +156,9 @@ class AprilAI(commands.Cog):
                             pipe=True
                         )
                         
-                        # Play audio
-                        vc.play(source)
-                        while vc.is_playing():
+                        # Play audio using Red's method
+                        voice_client.play(source)
+                        while voice_client.is_playing():
                             await asyncio.sleep(0.1)
                     else:
                         error = await response.text()
@@ -274,10 +222,6 @@ class AprilAI(commands.Cog):
         embed.add_field(name="Voice ID", value=config['voice_id'])
         embed.add_field(name="TTS Enabled", value=("✅" if config['tts_enabled'] else "❌"))
         embed.add_field(name="Text w/Voice", value=("✅" if config['text_response_when_voice'] else "❌"))
-        embed.add_field(name="PyNaCl Status", value=(
-            "✅ Functional" if self.nacl_available 
-            else "❌ Not working - reinstall required"
-        ))
         
         # AI settings
         embed.add_field(name="Model", value=config['model'])
@@ -330,11 +274,8 @@ class AprilAI(commands.Cog):
         if not ctx.guild:
             return await ctx.send("❌ This command only works in servers!")
             
-        if ctx.guild.id in self.voice_clients:
-            vc = self.voice_clients[ctx.guild.id]
-            await vc.disconnect(force=True)
-            del self.voice_clients[ctx.guild.id]
-            
+        if ctx.guild.voice_client:
+            await ctx.guild.voice_client.disconnect()
             # Cancel any active TTS task
             if ctx.guild.id in self.active_tts_tasks:
                 try:
@@ -342,10 +283,6 @@ class AprilAI(commands.Cog):
                 except:
                     pass
                 del self.active_tts_tasks[ctx.guild.id]
-                
-            await ctx.send("👋 Left voice channel")
-        elif ctx.guild.voice_client:
-            await ctx.guild.voice_client.disconnect(force=True)
             await ctx.send("👋 Left voice channel")
         else:
             await ctx.send("❌ Not in a voice channel")
@@ -391,12 +328,10 @@ class AprilAI(commands.Cog):
 
     async def send_text_response(self, ctx, response: str):
         """Send response with smart formatting"""
-        # Send as file if over 1900 characters
+        # For very long responses, use pagination
         if len(response) > 1900:
-            await ctx.send(file=discord.File(
-                filename="april_response.txt",
-                fp=response.encode('utf-8')
-            ))
+            pages = list(pagify(response, delims=["\n", " "], priority=True, page_length=1500))
+            await menu(ctx, pages, DEFAULT_CONTROLS)
         else:
             await ctx.send(response)
 
@@ -406,19 +341,20 @@ class AprilAI(commands.Cog):
         if member.bot:
             return
         
-        guild_id = member.guild.id
-        if guild_id in self.voice_clients:
-            vc = self.voice_clients[guild_id]
-            # Ensure we're still in a channel
-            if vc.channel and len(vc.channel.members) == 1:  # Only bot remains
-                await vc.disconnect(force=True)
-                del self.voice_clients[guild_id]
-                if guild_id in self.active_tts_tasks:
+        guild = member.guild
+        voice_client = guild.voice_client
+        
+        if voice_client and voice_client.channel:
+            # Check if only the bot is left in the channel
+            if len(voice_client.channel.members) == 1:
+                await voice_client.disconnect()
+                # Cancel any active TTS task
+                if guild.id in self.active_tts_tasks:
                     try:
-                        self.active_tts_tasks[guild_id].cancel()
+                        self.active_tts_tasks[guild.id].cancel()
                     except:
                         pass
-                    del self.active_tts_tasks[guild_id]
+                    del self.active_tts_tasks[guild.id]
 
 async def setup(bot):
     await bot.add_cog(AprilAI(bot))
