@@ -1,0 +1,170 @@
+{
+  "id": null,
+  "uid": null,
+  "title": "Discord loki Logger",
+  "tags": ["discord", "loki", "logs"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "panels": [
+    {
+      "type": "logs",
+      "title": "Live Discord Log Stream",
+      "datasource": "loki",
+      "id": 1,
+      "targets": [
+        {
+          "expr": "{app=\"discord-bot\"}",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "showLabels": true,
+        "showTime": true,
+        "wrapLogMessage": true,
+        "sortOrder": "Descending"
+      },
+      "gridPos": {"h": 12, "w": 24, "x": 0, "y": 0}
+    },
+    {
+      "type": "stat",
+      "title": "Messages per Minute (Total)",
+      "datasource": "loki",
+      "id": 2,
+      "targets": [
+        {
+          "expr": "count_over_time({app=\"discord-bot\",event_type=\"message\"}[1m])",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": {"calcs":["last"],"fields":"","values":false},
+        "orientation": "horizontal",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "gridPos": {"h": 5, "w": 6, "x": 0, "y": 12}
+    },
+    {
+      "type": "stat",
+      "title": "Edits per Minute",
+      "datasource": "loki",
+      "id": 3,
+      "targets": [
+        {
+          "expr": "count_over_time({app=\"discord-bot\",event_type=\"edit\"}[1m])",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": {"calcs":["last"],"fields":"","values":false},
+        "orientation": "horizontal",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "gridPos": {"h": 5, "w": 6, "x": 6, "y": 12}
+    },
+    {
+      "type": "stat",
+      "title": "Deletes per Minute",
+      "datasource": "loki",
+      "id": 4,
+      "targets": [
+        {
+          "expr": "count_over_time({app=\"discord-bot\",event_type=\"delete\"}[1m])",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": {"calcs":["last"],"fields":"","values":false},
+        "orientation": "horizontal",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "gridPos": {"h": 5, "w": 6, "x": 12, "y": 12}
+    },
+    {
+      "type": "stat",
+      "title": "Reactions per Minute",
+      "datasource": "loki",
+      "id": 5,
+      "targets": [
+        {
+          "expr": "count_over_time({app=\"discord-bot\",event_type=\"reaction\"}[1m])",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "reduceOptions": {"calcs":["last"],"fields":"","values":false},
+        "orientation": "horizontal",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "gridPos": {"h": 5, "w": 6, "x": 18, "y": 12}
+    },
+    {
+      "type": "piechart",
+      "title": "Event Type Distribution (Last Hour)",
+      "datasource": "loki",
+      "id": 6,
+      "targets": [
+        {
+          "expr": "sum by(event_type) (count_over_time({app=\"discord-bot\"}[1h]))",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {"h": 6, "w": 8, "x": 0, "y": 17}
+    },
+    {
+      "type": "table",
+      "title": "Top 10 Active Channels (Last Hour)",
+      "datasource": "loki",
+      "id": 7,
+      "targets": [
+        {
+          "expr": "topk(10, sum by(channel_id) (count_over_time({app=\"discord-bot\",event_type=\"message\"}[1h])))",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {"h": 6, "w": 8, "x": 8, "y": 17}
+    },
+    {
+      "type": "table",
+      "title": "Top 10 Active Users (Last Hour)",
+      "datasource": "loki",
+      "id": 8,
+      "targets": [
+        {
+          "expr": "{app=\"discord-bot\",event_type=\"message\"} | json | topk(10, count_over_time(author.id[1h]))",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {"h": 6, "w": 8, "x": 16, "y": 17}
+    },
+    {
+      "type": "logs",
+      "title": "Search Discord Logs",
+      "datasource": "loki",
+      "id": 9,
+      "targets": [
+        {
+          "expr": "{app=\"discord-bot\"}",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "showLabels": true,
+        "showTime": true,
+        "wrapLogMessage": true,
+        "sortOrder": "Descending",
+        "dedupStrategy": "none"
+      },
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 23}
+    }
+  ]
+}

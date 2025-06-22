@@ -1,0 +1,11 @@
+{
+    "name": "April AI",
+    "author": "Your Name",
+    "description": "Deepseek start for April AI, adding other GPTs...",
+    "install_msg": "Thanks for installing April AI! Set your API key with [p]deepseek apikey",
+    "short": "April OWEN",
+    "tags": ["ai", "april", "chat"],
+    "requirements": ["aiohttp"],
+    "min_bot_version": "3.5.0",
+    "end_user_data_statement": "This cog does not persistently store end user data."
+}
