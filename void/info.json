@@ -1,0 +1,10 @@
+{
+    "name": "VoidOracle",
+    "author": "Whoa, who",
+    "short": "Existential answers to life's meaningless questions",
+    "description": "Ask the void and receive nihilistic, cryptic, or existential responses",
+    "install_msg": "🔮 The void awaits your questions... Use `[p]void <question>` to confront the abyss",
+    "tags": ["fun", "existential", "nihilism"],
+    "requirements": [],
+    "end_user_data_statement": "This cog does not store user data."
+}
