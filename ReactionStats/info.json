@@ -1,0 +1,10 @@
+{
+    "name": "ReactionStats",
+    "author": "Your Name",
+    "short": "Analyze message reaction statistics",
+    "description": "Provides insights on most reacted messages using Loki data",
+    "install_msg": "⚠️ Requires LokiLogger cog to be configured first! Use `[p]reactionstats top` to get started.",
+    "tags": ["analytics", "statistics", "reactions"],
+    "requirements": ["aiohttp", "dateparser"],
+    "end_user_data_statement": "This cog queries message reaction data stored in Loki but does not store any user data itself."
+}
