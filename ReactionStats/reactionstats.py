@@ -1,7 +1,7 @@
 import aiohttp
 import json
 import math
-import time  # Added missing import
+import time  # Fixed import
 from datetime import datetime, timedelta
 import dateparser
 import discord
@@ -21,13 +21,11 @@ class ReactionStats(commands.Cog):
         
     async def get_loki_config(self):
         """Get Loki configuration from LokiLogger cog"""
-        # Try to get config from LokiLogger
         lokilogger_cog = self.bot.get_cog("LokiLogger")
         if lokilogger_cog:
             loki_config = await lokilogger_cog.config.all()
             return loki_config.get("loki_url", ""), loki_config.get("auth_token", "")
         
-        # Fallback to our own config
         config = await self.config.all()
         return config.get("loki_url", ""), config.get("auth_token", "")
     
@@ -112,7 +110,7 @@ class ReactionStats(commands.Cog):
                     "author": author,
                     "timestamp": timestamp
                 })
-            except (KeyError, ValueError):
+            except (KeyError, ValueError, IndexError):
                 continue
         
         # Sort and limit results
@@ -187,7 +185,6 @@ class ReactionStats(commands.Cog):
         )
         await ctx.send(msg)
 
-# If not using LokiLogger, these commands allow manual configuration
     @reactionstats.command()
     @commands.is_owner()
     async def seturl(self, ctx, url: str):
