@@ -188,6 +188,26 @@ class AprilAI(commands.Cog):
 
     @deepseek.command()
     async def settings(self, ctx):
+    """Show current configuration"""
+    config = await self.config.all()
+    embed = discord.Embed(title="April AI Configuration", color=await ctx.embed_color())
+    
+    # API keys (masked)
+    embed.add_field(name="DeepSeek Key", value=f"`...{config['deepseek_key'][-4:]}`" if config['deepseek_key'] else "❌ Not set")
+    embed.add_field(name="TTS Key", value=f"`...{config['tts_key'][-4:]}`" if config['tts_key'] else "❌ Not set")
+    
+    # Voice settings
+    embed.add_field(name="Voice ID", value=config['voice_id'])
+    embed.add_field(name="TTS Enabled", value=("✅" if config['tts_enabled'] else "❌"))
+    embed.add_field(name="Text w/Voice", value=("✅" if config['text_response_when_voice'] else "❌"))
+    
+    # AI settings
+    embed.add_field(name="Model", value=config['model'])
+    embed.add_field(name="Temperature", value=config['temperature'])
+    embed.add_field(name="Max Tokens", value=config['max_tokens'])
+    embed.add_field(name="System Prompt", value=f"```{config['system_prompt'][:1000]}```", inline=False)
+    
+    await ctx.send(embed=embed)
         """Show current configuration"""
         config = await self.config.all()
         embed = discord.Embed(title="April AI Configuration", color=await ctx.embed_color())
