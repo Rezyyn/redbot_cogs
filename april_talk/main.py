@@ -5,6 +5,8 @@ from redbot.core import commands, Config
 from redbot.core.bot import Red
 from redbot.core.utils.chat_formatting import pagify
 from redbot.core.utils.menus import close_menu, menu, DEFAULT_CONTROLS
+import tempfile
+import os
 
 class AprilAI(commands.Cog):
     """Unified AI assistant with text and voice capabilities"""
@@ -115,7 +117,7 @@ class AprilAI(commands.Cog):
         )
 
     async def play_tts(self, voice_client, tts_key, voice_id, text: str):
-        """Play TTS audio in voice channel"""
+        """Play TTS audio in voice channel using temporary files"""
         # Split long text into chunks
         chunks = [text[i:i+2000] for i in range(0, len(text), 2000)]
         
@@ -145,24 +147,37 @@ class AprilAI(commands.Cog):
                     timeout=30
                 ) as response:
                     if response.status == 200:
-                        # Create in-memory audio source
-                        audio_data = await response.read()
+                        # Create temporary file
+                        with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as temp_file:
+                            audio_data = await response.read()
+                            temp_file.write(audio_data)
+                            temp_file_path = temp_file.name
                         
-                        # Use Red's audio source creation
+                        # Create audio source from file
                         source = discord.FFmpegPCMAudio(
-                            source="pipe:0", 
-                            before_options="-f mp3",
-                            options="-loglevel warning",
-                            pipe=True
+                            executable="ffmpeg",
+                            source=temp_file_path,
+                            before_options="-loglevel warning"
                         )
                         
-                        # Play audio using Red's method
+                        # Play audio
                         voice_client.play(source)
+                        
+                        # Wait for playback to complete
                         while voice_client.is_playing():
                             await asyncio.sleep(0.1)
+                            
+                        # Clean up temporary file
+                        try:
+                            os.unlink(temp_file_path)
+                        except:
+                            pass
                     else:
                         error = await response.text()
                         print(f"ElevenLabs API error: {error}")
+            except asyncio.CancelledError:
+                # Task was cancelled, clean up if needed
+                return
             except Exception as e:
                 print(f"TTS playback error: {str(e)}")
 
