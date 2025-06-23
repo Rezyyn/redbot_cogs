@@ -3,10 +3,16 @@ import aiohttp
 import discord
 import tempfile
 import os
+import logging
 from redbot.core import commands, Config
 from redbot.core.bot import Red
 from redbot.core.utils.chat_formatting import pagify
 from redbot.core.utils.menus import menu, DEFAULT_CONTROLS
+
+# Initialize logger for this Cog
+tllogger = logging.getLogger("red.aprilai")
+
+tllogger.setLevel(logging.DEBUG)
 
 class AprilAI(commands.Cog):
     """Unified AI assistant with text and voice via Redbot’s Audio cog"""
@@ -15,6 +21,7 @@ class AprilAI(commands.Cog):
         self.bot = bot
         self.config = Config.get_conf(self, identifier=1398462)
         self.session = aiohttp.ClientSession()
+        self.active_tts_tasks = {}
 
         default_global = {
             "deepseek_key": "",
@@ -28,10 +35,9 @@ class AprilAI(commands.Cog):
             "text_response_when_voice": True
         }
         self.config.register_global(**default_global)
-        self.active_tts_tasks = {}
 
     def cog_unload(self):
-        # close aiohttp session
+        tllogger.debug("Unloading AprilAI cog, closing session and cancelling tasks.")
         self.bot.loop.create_task(self.session.close())
         for task in self.active_tts_tasks.values():
             task.cancel()
@@ -45,117 +51,117 @@ class AprilAI(commands.Cog):
             return await self.join_voice(ctx)
         if cmd == "leave":
             return await self.april_leave(ctx)
-        # Debug: received input
-        print(f"AprilAI: Received input '{input}' from {ctx.author} in {ctx.guild}")
+        tllogger.debug(f"Received april command with input: {input} by {ctx.author}")
         await self.process_query(ctx, input)
 
     async def join_voice(self, ctx):
         """Delegate to Redbot’s Audio cog to join the channel."""
-        print("AprilAI: Attempting to join voice channel")
+        tllogger.debug("Attempting to join voice channel.")
         if not ctx.guild:
             return await ctx.send("❌ This command only works in servers!")
-        channel = ctx.author.voice.channel if ctx.author.voice else None
-        if not channel:
+        if not ctx.author.voice or not ctx.author.voice.channel:
             return await ctx.send("❌ You need to be in a voice channel!")
 
         audio_cog = self.bot.get_cog("Audio")
         if audio_cog:
-            print(f"AprilAI: Invoking summon for channel {channel.name}")
+            channel = ctx.author.voice.channel
+            tllogger.debug(f"Invoking summon for channel: {channel.name}")
             await ctx.invoke(self.bot.get_command("summon"))
-            await ctx.send(f"🔊 (debug) summon invoked for {channel.name}")
+            await ctx.send(f"🔊 Joined {channel.name} (via summon)")
         else:
-            print("AprilAI: Audio cog not found")
+            tllogger.error("Audio cog not found when attempting join.")
             await ctx.send("❌ Audio cog not found. Install Redbot Audio to use voice features.")
 
     async def april_leave(self, ctx):
-        """Disconnect from current voice channel."""
-        print("AprilAI: Attempting to disconnect from voice channel")
+        """Disconnect from current voice channel via direct call."""
+        tllogger.debug("Attempting to disconnect from voice channel.")
         vc = ctx.guild.voice_client
         if vc:
             await vc.disconnect()
-            print("AprilAI: Disconnected")
-            await ctx.send("👋 Disconnected from voice channel")
+            tllogger.debug("Disconnected from voice channel.")
+            await ctx.send("👋 Disconnected from voice channel.")
         else:
-            print("AprilAI: No voice client to disconnect")
-            await ctx.send("❌ Not connected to any voice channel")
+            tllogger.warning("No voice client to disconnect.")
+            await ctx.send("❌ Not connected to any voice channel.")
 
     async def process_query(self, ctx, input_text):
         """Handle text vs. voice response logic."""
         use_voice = await self.config.tts_enabled() and ctx.guild and ctx.guild.voice_client
-        print(f"AprilAI: use_voice={use_voice}")
+        tllogger.debug(f"process_query: use_voice={use_voice}")
         async with ctx.typing():
             try:
                 resp = await self.query_deepseek(ctx.author.id, input_text, ctx)
-                print(f"AprilAI: Received AI response of length {len(resp)}")
+                tllogger.debug(f"AI response length: {len(resp)}")
                 if not (use_voice and not await self.config.text_response_when_voice()):
                     await self.send_text_response(ctx, resp)
                 if use_voice:
                     await self.speak_response(ctx.guild, resp)
             except Exception as e:
-                print(f"AprilAI: process_query error: {e}")
+                tllogger.exception("Error in process_query")
                 await ctx.send(f"❌ Error: {e}")
 
     async def speak_response(self, guild, text: str):
         """Schedule TTS playback via temporary file."""
-        print(f"AprilAI: Scheduling TTS for guild {guild.id}")
+        tllogger.debug(f"Scheduling TTS for guild: {guild.id}")
         tts_key = await self.config.tts_key()
-        voice_id = await self.config.voice_id()
+        if not tts_key:
+            tllogger.warning("No TTS key set; skipping TTS.")
+            return
         vc = guild.voice_client
         if not vc:
-            print("AprilAI: No voice client available for TTS")
-            return
-        if not tts_key:
-            print("AprilAI: No TTS key set; skipping TTS")
+            tllogger.warning("No voice client available for TTS.")
             return
         if guild.id in self.active_tts_tasks:
             self.active_tts_tasks[guild.id].cancel()
-        self.active_tts_tasks[guild.id] = asyncio.create_task(
-            self._play_tts(vc, tts_key, voice_id, text)
-        )
+        task = asyncio.create_task(self._play_tts(vc, tts_key, await self.config.voice_id(), text))
+        self.active_tts_tasks[guild.id] = task
 
     async def _play_tts(self, voice_client, tts_key, voice_id, text: str):
         """Fetch MP3 from ElevenLabs, save to temp file, and play."""
-        print("AprilAI: Starting _play_tts")
+        tllogger.debug("_play_tts started.")
         chunks = [text[i:i+2000] for i in range(0, len(text), 2000)]
         for idx, chunk in enumerate(chunks, 1):
             if not chunk.strip():
                 continue
-            print(f"AprilAI: TTS chunk {idx}/{len(chunks)}")
+            tllogger.debug(f"TTS chunk {idx}/{len(chunks)}")
             headers = {"xi-api-key": tts_key, "Content-Type": "application/json"}
             payload = {"text": chunk, "voice_settings": {"stability":0.5,"similarity_boost":0.8}}
-            audio_data = None
             try:
                 async with self.session.post(
                     f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
                     json=payload, headers=headers, timeout=30
                 ) as resp:
                     if resp.status != 200:
-                        text_error = await resp.text()
-                        print(f"AprilAI: TTS API error: {resp.status} {text_error}")
+                        errtxt = await resp.text()
+                        tllogger.error(f"TTS API error {resp.status}: {errtxt}")
                         continue
-                    audio_data = await resp.read()
-                    print(f"AprilAI: Received {len(audio_data)} bytes of audio")
-            except Exception as e:
-                print(f"AprilAI: TTS fetch error: {e}")
+                    data = await resp.read()
+                    tllogger.debug(f"Received {len(data)} bytes from TTS API.")
+            except Exception:
+                tllogger.exception("Exception during TTS fetch.")
                 continue
 
+            path = None
             try:
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tf:
-                    tf.write(audio_data)
+                    tf.write(data)
                     path = tf.name
-                    print(f"AprilAI: Wrote audio to {path}")
+                tllogger.debug(f"Wrote TTS to temp file: {path}")
                 source = discord.FFmpegPCMAudio(path, before_options="-loglevel warning")
                 voice_client.play(source)
-                print("AprilAI: Playing audio...")
+                tllogger.debug("Playing TTS audio...")
                 while voice_client.is_playing():
                     await asyncio.sleep(0.1)
-                print("AprilAI: Playback finished")
+                tllogger.debug("TTS playback finished.")
+            except Exception:
+                tllogger.exception("Exception during TTS playback.")
             finally:
-                try:
-                    os.unlink(path)
-                    print(f"AprilAI: Deleted temp file {path}")
-                except Exception as e:
-                    print(f"AprilAI: Failed to delete temp file: {e}")
+                if path:
+                    try:
+                        os.unlink(path)
+                        tllogger.debug(f"Deleted temp file: {path}")
+                    except Exception:
+                        tllogger.exception("Failed to delete temp file.")
 
     @commands.group(name="deepseek", aliases=["ds"])
     @commands.is_owner()
