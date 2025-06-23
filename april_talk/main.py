@@ -4,9 +4,10 @@ import discord
 from redbot.core import commands, Config
 from redbot.core.bot import Red
 from redbot.core.utils.chat_formatting import pagify
-from redbot.core.utils.menus import close_menu, menu, DEFAULT_CONTROLS
+from redbot.core.utils.menus import menu, DEFAULT_CONTROLS
 import tempfile
 import os
+import sys
 
 class AprilAI(commands.Cog):
     """Unified AI assistant with text and voice capabilities"""
@@ -73,27 +74,32 @@ class AprilAI(commands.Cog):
                 await ctx.send(f"❌ Error: {str(e)}")
 
     async def join_voice(self, ctx):
-        """Join the user's voice channel"""
+        """Join the user's voice channel using Redbot's standard method"""
         if not ctx.guild:
             return await ctx.send("❌ This command only works in servers!")
         
         if not ctx.author.voice or not ctx.author.voice.channel:
             return await ctx.send("❌ You need to be in a voice channel!")
         
-        # Join voice channel using Red's standard method
         try:
-            # Get existing voice client or create new one
-            voice_client = ctx.guild.voice_client
-            if not voice_client:
-                voice_client = await ctx.author.voice.channel.connect()
-                await ctx.send(f"🔊 Joined {ctx.author.voice.channel.name}")
-            elif voice_client.channel != ctx.author.voice.channel:
-                await voice_client.move_to(ctx.author.voice.channel)
-                await ctx.send(f"🔊 Moved to {ctx.author.voice.channel.name}")
+            # Get the voice channel
+            channel = ctx.author.voice.channel
+            
+            # Check if we're already connected to this channel
+            if ctx.voice_client and ctx.voice_client.channel == channel:
+                return await ctx.send("✅ Already in your voice channel")
+            
+            # Connect or move to the channel
+            if ctx.voice_client:
+                await ctx.voice_client.move_to(channel)
+                await ctx.send(f"🔊 Moved to {channel.name}")
             else:
-                await ctx.send("✅ Already in your voice channel")
-        except Exception as e:
+                await channel.connect()
+                await ctx.send(f"🔊 Joined {channel.name}")
+        except discord.ClientException as e:
             await ctx.send(f"❌ Failed to join voice: {str(e)}")
+        except Exception as e:
+            await ctx.send(f"❌ Unexpected error: {str(e)}")
 
     async def speak_response(self, guild, text: str):
         """Convert text to speech using ElevenLabs"""
@@ -155,7 +161,6 @@ class AprilAI(commands.Cog):
                         
                         # Create audio source from file
                         source = discord.FFmpegPCMAudio(
-                            executable="ffmpeg",
                             source=temp_file_path,
                             before_options="-loglevel warning"
                         )
@@ -289,8 +294,8 @@ class AprilAI(commands.Cog):
         if not ctx.guild:
             return await ctx.send("❌ This command only works in servers!")
             
-        if ctx.guild.voice_client:
-            await ctx.guild.voice_client.disconnect()
+        if ctx.voice_client:
+            await ctx.voice_client.disconnect()
             # Cancel any active TTS task
             if ctx.guild.id in self.active_tts_tasks:
                 try:
