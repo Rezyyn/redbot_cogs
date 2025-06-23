@@ -1,6 +1,8 @@
 import asyncio
 import aiohttp
 import discord
+import tempfile
+import os
 import io
 from redbot.core import commands, Config
 from redbot.core.bot import Red
@@ -99,7 +101,53 @@ class AprilAI(commands.Cog):
             self.play_tts(voice_client, tts_key, voice_id, text)
         )
 
-    async def play_tts(self, voice_client, tts_key, voice_id, text: str):
+async def play_tts(self, voice_client, tts_key, voice_id, text: str):
+    chunks = [text[i:i+2000] for i in range(0, len(text), 2000)]
+    for chunk in chunks:
+        if not chunk.strip():
+            continue
+
+        headers = {
+            "xi-api-key": tts_key,
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "text": chunk,
+            "voice_settings": {
+                "stability": 0.5,
+                "similarity_boost": 0.8
+            }
+        }
+        try:
+            async with self.session.post(
+                f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
+                json=payload,
+                headers=headers,
+                timeout=30
+            ) as response:
+                if response.status == 200:
+                    audio_data = await response.read()
+                    # Write to a temp file
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp_audio:
+                        temp_audio.write(audio_data)
+                        temp_filename = temp_audio.name
+                    # Play audio from file
+                    source = discord.FFmpegPCMAudio(
+                        temp_filename,
+                        before_options="-f mp3",
+                        options="-loglevel warning"
+                    )
+                    if not voice_client.is_playing():
+                        voice_client.play(source)
+                        while voice_client.is_playing():
+                            await asyncio.sleep(0.1)
+                    os.unlink(temp_filename)
+                else:
+                    error = await response.text()
+                    print(f"ElevenLabs API error: {error}")
+        except Exception as e:
+            print(f"TTS playback error: {str(e)}")
+
         # Split long text into chunks
         chunks = [text[i:i+2000] for i in range(0, len(text), 2000)]
         
