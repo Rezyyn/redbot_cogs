@@ -145,7 +145,7 @@ class AprilAI(commands.Cog):
                     path = tf.name
                 tllogger.debug(f"Wrote TTS to temp file: {path}")
                 tllogger.debug(f"Invoking play command for file: {path}")
-                await ctx.invoke(play_cmd, source=path)
+                await ctx.invoke(play_cmd, url=path)
                 tllogger.debug("Play command invoked.")
                 vc = ctx.guild.voice_client
                 while vc and vc.is_playing():
