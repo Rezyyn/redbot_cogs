@@ -55,8 +55,8 @@ class AprilAI(commands.Cog):
         if audio_cog:
             # Call Redbot Audio's summon
             await ctx.invoke(self.bot.get_command("summon"))
-            return
-        await ctx.send("❌ Audio cog not found. Install Redbot Audio to use voice features.")
+        else:
+            await ctx.send("❌ Audio cog not found. Install Redbot Audio to use voice features.")
 
     async def process_query(self, ctx, input_text):
         """Handle text vs. voice response logic."""
@@ -126,34 +126,48 @@ class AprilAI(commands.Cog):
 
     @deepseek.command()
     async def apikey(self, ctx, key: str):
-        await self.config.deepseek_key.set(key); await ctx.tick()
+        await self.config.deepseek_key.set(key)
+        await ctx.tick()
+
     @deepseek.command()
     async def prompt(self, ctx, *, system_prompt: str):
-        await self.config.system_prompt.set(system_prompt); await ctx.tick()
+        await self.config.system_prompt.set(system_prompt)
+        await ctx.tick()
+
     @deepseek.command()
     async def model(self, ctx, model_name: str):
-        await self.config.model.set(model_name.lower()); await ctx.tick()
+        await self.config.model.set(model_name.lower())
+        await ctx.tick()
+
     @deepseek.command()
     async def temperature(self, ctx, value: float):
-        if 0.0 <= value <= 1.0: await self.config.temperature.set(value); await ctx.tick()
-        else: await ctx.send("❌ Temp must be 0.0–1.0")
+        if 0.0 <= value <= 1.0:
+            await self.config.temperature.set(value)
+            await ctx.tick()
+        else:
+            await ctx.send("❌ Temp must be 0.0–1.0")
+
     @deepseek.command()
     async def tokens(self, ctx, max_tokens: int):
-        if 100 <= max_tokens <= 4096: await self.config.max_tokens.set(max_tokens); await ctx.tick()
-        else: await ctx.send("❌ Tokens must be 100–4096")
+        if 100 <= max_tokens <= 4096:
+            await self.config.max_tokens.set(max_tokens)
+            await ctx.tick()
+        else:
+            await ctx.send("❌ Tokens must be 100–4096")
+
     @deepseek.command()
     async def settings(self, ctx):
         cfg = await self.config.all()
         e = discord.Embed(title="April AI Settings", color=await ctx.embed_color())
-        e.add_field("DeepSeek Key", f"`...{cfg['deepseek_key'][-4:]}`" if cfg["deepseek_key"] else "❌ Not set")
-        e.add_field("TTS Key", f"`...{cfg['tts_key'][-4:]}`" if cfg["tts_key"] else "❌ Not set")
-        e.add_field("Voice ID", cfg["voice_id"])  
-        e.add_field("TTS Enabled", "✅" if cfg["tts_enabled"] else "❌")
-        e.add_field("Text w/Voice", "✅" if cfg["text_response_when_voice"] else "❌")
-        e.add_field("Model", cfg["model"])
-        e.add_field("Temperature", str(cfg["temperature"]))
-        e.add_field("Max Tokens", str(cfg["max_tokens"]))
-        e.add_field("System Prompt", f"```{cfg['system_prompt']}```", inline=False)
+        e.add_field(name="DeepSeek Key", value=(f"...{cfg['deepseek_key'][-4:]}" if cfg['deepseek_key'] else "❌ Not set"), inline=True)
+        e.add_field(name="TTS Key", value=(f"...{cfg['tts_key'][-4:]}" if cfg['tts_key'] else "❌ Not set"), inline=True)
+        e.add_field(name="Voice ID", value=cfg['voice_id'], inline=True)
+        e.add_field(name="TTS Enabled", value=("✅" if cfg['tts_enabled'] else "❌"), inline=True)
+        e.add_field(name="Text w/Voice", value=("✅" if cfg['text_response_when_voice'] else "❌"), inline=True)
+        e.add_field(name="Model", value=cfg['model'], inline=True)
+        e.add_field(name="Temperature", value=str(cfg['temperature']), inline=True)
+        e.add_field(name="Max Tokens", value=str(cfg['max_tokens']), inline=True)
+        e.add_field(name="System Prompt", value=f"```{cfg['system_prompt']}```", inline=False)
         await ctx.send(embed=e)
 
     async def query_deepseek(self, user_id: int, question: str, ctx):
@@ -164,8 +178,8 @@ class AprilAI(commands.Cog):
         payload = {
             "model": await self.config.model(),
             "messages": [
-                {"role":"system","content":await self.config.system_prompt()},
-                {"role":"user","content":f"[User:{ctx.author.display_name}] {question}"}
+                {"role": "system", "content": await self.config.system_prompt()},
+                {"role": "user", "content": f"[User:{ctx.author.display_name}] {question}"}
             ],
             "temperature": await self.config.temperature(),
             "max_tokens": await self.config.max_tokens(),
@@ -177,13 +191,13 @@ class AprilAI(commands.Cog):
         ) as r:
             data = await r.json()
             if r.status != 200:
-                err = data.get("error",{}).get("message","Unknown")
+                err = data.get("error", {}).get("message", "Unknown")
                 raise Exception(f"API {r.status}: {err}")
             return data["choices"][0]["message"]["content"].strip()
 
     async def send_text_response(self, ctx, response: str):
         if len(response) > 1900:
-            pages = list(pagify(response, delims=["\n"," "], priority=True, page_length=1500))
+            pages = list(pagify(response, delims=["\n", " "], priority=True, page_length=1500))
             await menu(ctx, pages, DEFAULT_CONTROLS)
         else:
             await ctx.send(response)
