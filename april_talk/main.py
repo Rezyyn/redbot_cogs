@@ -146,13 +146,9 @@ class AprilAI(commands.Cog):
                 tllogger.debug(f"Wrote TTS to temp file: {path}")
                 tllogger.debug(f"Invoking play command for file: {path}")
                                 # Direct playback of the temp MP3 file
-                source = discord.FFmpegPCMAudio(path)
-                tllogger.debug("Playing via direct FFmpegPCMAudio source.")
-                vc = ctx.guild.voice_client
-                vc.play(source)
-                while vc.is_playing():
-                    await asyncio.sleep(0.1)
-                tllogger.debug("Direct playback finished.")
+                tllogger.debug(f"Invoking Audio.play for file: {path}")
+                await ctx.invoke(play_cmd, url=path)
+                tllogger.debug("Audio.play command invoked successfully.")
             except Exception:
                 tllogger.exception("Exception during Audio.play invocation.")
             finally:
