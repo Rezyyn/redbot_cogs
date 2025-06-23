@@ -50,62 +50,53 @@ class AprilAI(commands.Cog):
             return await self.join_voice(ctx)
         if cmd == "leave":
             return await self.april_leave(ctx)
-        tllogger.debug(f"Received april command with input: {input} by {ctx.author}")
+        tllogger.debug(f"Received april command: {input} from {ctx.author}")
         await self.process_query(ctx, input)
 
     async def join_voice(self, ctx):
-        """Delegate to Redbot’s Audio cog to join the channel."""
+        """Join user's voice via Redbot Audio cog"""
         tllogger.debug("Attempting to join voice channel.")
-        if not ctx.guild:
-            return await ctx.send("❌ This command only works in servers!")
-        if not ctx.author.voice or not ctx.author.voice.channel:
-            return await ctx.send("❌ You need to be in a voice channel!")
-
-        audio_cog = self.bot.get_cog("Audio")
-        if audio_cog:
+        if not ctx.guild or not ctx.author.voice or not ctx.author.voice.channel:
+            return await ctx.send("❌ You must be in a server voice channel.")
+        audio = self.bot.get_cog("Audio")
+        if audio:
             channel = ctx.author.voice.channel
-            tllogger.debug(f"Invoking summon for channel: {channel.name}")
             await ctx.invoke(self.bot.get_command("summon"))
-            await ctx.send(f"🔊 Joined {channel.name} (via summon)")
+            await ctx.send(f"🔊 Joined {channel.name}")
         else:
-            tllogger.error("Audio cog not found when attempting join.")
-            await ctx.send("❌ Audio cog not found. Install Redbot Audio to use voice features.")
+            tllogger.error("Audio cog missing.")
+            await ctx.send("❌ Audio cog not loaded.")
 
     async def april_leave(self, ctx):
-        """Disconnect from current voice channel via direct call."""
-        tllogger.debug("Attempting to disconnect from voice channel.")
+        """Disconnect from voice channel"""
         vc = ctx.guild.voice_client
         if vc:
             await vc.disconnect()
-            tllogger.debug("Disconnected from voice channel.")
-            await ctx.send("👋 Disconnected from voice channel.")
+            await ctx.send("👋 Disconnected.")
         else:
-            tllogger.warning("No voice client to disconnect.")
-            await ctx.send("❌ Not connected to any voice channel.")
+            await ctx.send("❌ Not connected.")
 
     async def process_query(self, ctx, input_text):
-        """Handle text vs. voice response logic."""
+        """Process text input and optionally speak response"""
         use_voice = await self.config.tts_enabled() and ctx.guild and ctx.guild.voice_client
-        tllogger.debug(f"process_query: use_voice={use_voice}")
+        tllogger.debug(f"process_query use_voice={use_voice}")
         async with ctx.typing():
             try:
-                resp = await self.query_deepseek(ctx.author.id, input_text, ctx)
-                tllogger.debug(f"AI response length: {len(resp)}")
+                response = await self.query_deepseek(ctx.author.id, input_text, ctx)
                 if not (use_voice and not await self.config.text_response_when_voice()):
-                    await self.send_text_response(ctx, resp)
+                    await self.send_text_response(ctx, response)
                 if use_voice:
-                    await self.speak_response(ctx, resp)
+                    await self.speak_response(ctx, response)
             except Exception as e:
-                tllogger.exception("Error in process_query")
+                tllogger.exception("process_query error")
                 await ctx.send(f"❌ Error: {e}")
 
     async def speak_response(self, ctx, text: str):
-        """Schedule TTS playback via Redbot Audio cog."""
+        """Kick off TTS playback task"""
         guild = ctx.guild
-        tllogger.debug(f"Scheduling TTS for guild: {guild.id}")
         tts_key = await self.config.tts_key()
-        if not tts_key:
-            tllogger.warning("No TTS key set; skipping TTS.")
+        if not tts_key or not ctx.guild.voice_client:
+            tllogger.warning("Skipping TTS, missing key or VC.")
             return
         if guild.id in self.active_tts_tasks:
             self.active_tts_tasks[guild.id].cancel()
@@ -113,100 +104,120 @@ class AprilAI(commands.Cog):
         self.active_tts_tasks[guild.id] = task
 
     async def _play_tts(self, ctx, tts_key, voice_id, text: str):
-        """Fetch MP3 from ElevenLabs, save to temp file, then invoke Audio.play."""
-        tllogger.debug("_play_tts started.")
+        """Fetch MP3, save to temp file, then use Audio.play(search=path)"""
+        tllogger.debug("_play_tts start")
         chunks = [text[i:i+2000] for i in range(0, len(text), 2000)]
         play_cmd = self.bot.get_command("play")
         for idx, chunk in enumerate(chunks, 1):
             if not chunk.strip():
                 continue
-            tllogger.debug(f"TTS chunk {idx}/{len(chunks)}")
-            headers = {"xi-api-key": tts_key, "Content-Type": "application/json"}
-            payload = {"text": chunk, "voice_settings": {"stability":0.5,"similarity_boost":0.8}}
+            tllogger.debug(f"Fetching TTS chunk {idx}/{len(chunks)}")
+            headers = {"xi-api-key": tts_key}
+            payload = {"text": chunk, "voice_settings": {"stability":0.5, "similarity_boost":0.8}}
             try:
                 async with self.session.post(
                     f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
                     json=payload, headers=headers, timeout=30
                 ) as resp:
-                    if resp.status != 200:
-                        errtxt = await resp.text()
-                        tllogger.error(f"TTS API error {resp.status}: {errtxt}")
-                        continue
+                    resp.raise_for_status()
                     data = await resp.read()
-                    tllogger.debug(f"Received {len(data)} bytes from TTS API.")
             except Exception:
-                tllogger.exception("Exception during TTS fetch.")
+                tllogger.exception("TTS fetch failed")
                 continue
 
             with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tf:
                 tf.write(data)
                 path = tf.name
-            tllogger.debug(f"Wrote TTS to temp file: {path}")
+            tllogger.debug(f"Saved TTS to {path}")
             try:
-                tllogger.debug(f"Invoking Audio.play for file: {path} (positional)")
-                await ctx.invoke(play_cmd, path)
-                tllogger.debug("Audio.play command invoked successfully.")
+                tllogger.debug(f"Invoking Audio.play with search={path}")
+                await ctx.invoke(play_cmd, search=path)
+                tllogger.debug("Audio.play invoked")
+                # wait for completion
+                vc = ctx.guild.voice_client
+                while vc and vc.is_playing():
+                    await asyncio.sleep(0.1)
             except Exception:
-                tllogger.exception("Exception during Audio.play invocation.")
+                tllogger.exception("Audio.play invocation failed")
             finally:
                 try:
                     os.unlink(path)
-                    tllogger.debug(f"Deleted temp file: {path}")
-                except Exception:
-                    tllogger.exception("Failed to delete temp file.")
+                    tllogger.debug(f"Deleted {path}")
+                except:
+                    pass
 
     @commands.group(name="deepseek", aliases=["ds"])
     @commands.is_owner()
     async def deepseek(self, ctx):
-        """Configure DeepSeek AI settings"""
+        """Configure DeepSeek settings"""
         pass
 
-    # Configuration commands...
     @deepseek.command()
     async def apikey(self, ctx, key: str):
-        await self.config.deepseek_key.set(key)
-        await ctx.tick()
-
+        await self.config.deepseek_key.set(key); await ctx.tick()
     @deepseek.command()
     async def prompt(self, ctx, *, system_prompt: str):
-        await self.config.system_prompt.set(system_prompt)
-        await ctx.tick()
-
+        await self.config.system_prompt.set(system_prompt); await ctx.tick()
     @deepseek.command()
     async def model(self, ctx, model_name: str):
-        await self.config.model.set(model_name.lower())
-        await ctx.tick()
-
+        await self.config.model.set(model_name.lower()); await ctx.tick()
     @deepseek.command()
-    async def temperature(self, ctx, value: float):
-        if 0.0 <= value <= 1.0:
-            await self.config.temperature.set(value)
-            await ctx.tick()
-        else:
-            await ctx.send("❌ Temp must be 0.0–1.0")
-
+    async def temperature(self, ctx, val: float):
+        if 0.0 <= val <= 1.0: await self.config.temperature.set(val); await ctx.tick()
+        else: await ctx.send("❌ Temp 0.0–1.0")
     @deepseek.command()
-    async def tokens(self, ctx, max_tokens: int):
-        if 100 <= max_tokens <= 4096:
-            await self.config.max_tokens.set(max_tokens)
-            await ctx.tick()
-        else:
-            await ctx.send("❌ Tokens must be 100–4096")
-
+    async def tokens(self, ctx, num: int):
+        if 100 <= num <= 4096: await self.config.max_tokens.set(num); await ctx.tick()
+        else: await ctx.send("❌ Tokens 100–4096")
     @deepseek.command()
     async def settings(self, ctx):
         cfg = await self.config.all()
-        e = discord.Embed(title="April AI Settings", color=await ctx.embed_color())
+        e = discord.Embed(title="AprilAI Settings", color=await ctx.embed_color())
         e.add_field(name="DeepSeek Key", value=(f"...{cfg['deepseek_key'][-4:]}" if cfg['deepseek_key'] else "❌ Not set"), inline=True)
         e.add_field(name="TTS Key", value=(f"...{cfg['tts_key'][-4:]}" if cfg['tts_key'] else "❌ Not set"), inline=True)
         e.add_field(name="Voice ID", value=cfg['voice_id'], inline=True)
         e.add_field(name="TTS Enabled", value=("✅" if cfg['tts_enabled'] else "❌"), inline=True)
         e.add_field(name="Text w/Voice", value=("✅" if cfg['text_response_when_voice'] else "❌"), inline=True)
         e.add_field(name="Model", value=cfg['model'], inline=True)
-        e.add_field(name="Temperature", value=str(cfg['temperature']), inline=True)
+        e.add_field(name="Temp", value=str(cfg['temperature']), inline=True)
         e.add_field(name="Max Tokens", value=str(cfg['max_tokens']), inline=True)
-        e.add_field(name="System Prompt", value=f"```{cfg['system_prompt']}```", inline=False)
+        e.add_field(name="Prompt", value=f"```{cfg['system_prompt']}```", inline=False)
         await ctx.send(embed=e)
+
+    async def query_deepseek(self, user_id: int, question: str, ctx):
+        key = await self.config.deepseek_key()
+        if not key: raise Exception("DeepSeek key missing.")
+        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+        payload = {"model": await self.config.model(),
+                   "messages":[{"role":"system","content":await self.config.system_prompt()},
+                                {"role":"user","content":f"[User:{ctx.author.display_name}] {question}"}],
+                   "temperature": await self.config.temperature(),
+                   "max_tokens": await self.config.max_tokens(),
+                   "user": str(user_id)}
+        async with self.session.post(
+            "https://api.deepseek.com/v1/chat/completions", json=payload,
+            headers=headers, timeout=30
+        ) as r:
+            data = await r.json()
+            if r.status != 200:
+                err = data.get("error",{}).get("message","?")
+                raise Exception(f"API {r.status}: {err}")
+            return data["choices"][0]["message"]["content"].strip()
+
+    async def send_text_response(self, ctx, response: str):
+        if len(response) > 1900:
+            pages = list(pagify(response, delims=["\n"," "], priority=True, page_length=1500))
+            await menu(ctx, pages, DEFAULT_CONTROLS)
+        else:
+            await ctx.send(response)
+
+    @commands.Cog.listener()
+    async def on_voice_state_update(self, member, before, after):
+        if member.bot: return
+        vc = member.guild.voice_client
+        if vc and len(vc.channel.members) == 1:
+            await vc.disconnect()
+            self.active_tts_tasks.pop(member.guild.id, None)
 
 async def setup(bot):
     await bot.add_cog(AprilAI(bot))
