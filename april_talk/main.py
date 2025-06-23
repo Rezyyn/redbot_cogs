@@ -50,31 +50,26 @@ class AprilAI(commands.Cog):
         tllogger.debug(f"Command april: {input} by {ctx.author}")
         await self.process_query(ctx, input)
 
-    async def join_voice(self, ctx):
-        """Use discord.VoiceClient to join voice channel, bypassing Lavalink."""
+        async def join_voice(self, ctx):
+        """Join user's voice channel via Redbot Audio cog's summon."""
         tllogger.debug("join_voice invoked")
         if not ctx.guild or not ctx.author.voice or not ctx.author.voice.channel:
             return await ctx.send("❌ You must be in a voice channel.")
-        channel = ctx.author.voice.channel
-        vc = ctx.guild.voice_client
-        # If existing Lavalink player: disconnect
-        if vc and not isinstance(vc, discord.VoiceClient):
-            tllogger.debug("Disconnecting existing Lavalink player")
-            await vc.disconnect()
-            vc = None
-        # Move or connect
-        try:
-            if isinstance(vc, discord.VoiceClient):
-                if vc.channel != channel:
-                    await vc.move_to(channel)
-            else:
-                vc = await channel.connect()
-            await ctx.send(f"🔊 Joined {channel.name}")
-        except Exception as e:
-            tllogger.exception("Failed join_voice")
-            await ctx.send(f"❌ Join failed: {e}")
+        audio = self.bot.get_cog("Audio")
+        cmd = self.bot.get_command("summon")
+        if audio and cmd:
+            try:
+                await ctx.invoke(cmd)
+                tllogger.debug("Summon command invoked")
+                await ctx.send(f"🔊 Joined {ctx.author.voice.channel.name}")
+            except Exception as e:
+                tllogger.exception("Failed to summon via Audio cog")
+                await ctx.send(f"❌ Join failed: {e}")
+        else:
+            tllogger.error("Audio cog or summon command not found.")
+            await ctx.send("❌ Audio cog not available. Please install the Audio cog.")
 
-    async def leave_voice(self, ctx):
+    async def leave_voice(self, ctx):(self, ctx):
         vc = ctx.guild.voice_client
         if isinstance(vc, discord.VoiceClient):
             try:
