@@ -191,7 +191,7 @@ class AprilAI(commands.Cog):
         ) as r:
             data = await r.json()
             if r.status != 200:
-                err = data.get("error",{}").get("message","?")
+                err = data.get("error", {}).get("message", "?")
                 raise Exception(f"API {r.status}: {err}")
             return data["choices"][0]["message"]["content"].strip()
 
