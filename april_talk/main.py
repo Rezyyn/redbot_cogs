@@ -138,27 +138,22 @@ class AprilAI(commands.Cog):
                 tllogger.exception("Exception during TTS fetch.")
                 continue
 
-            path = None
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tf:
+                tf.write(data)
+                path = tf.name
+            tllogger.debug(f"Wrote TTS to temp file: {path}")
             try:
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tf:
-                    tf.write(data)
-                    path = tf.name
-                tllogger.debug(f"Wrote TTS to temp file: {path}")
-                tllogger.debug(f"Invoking play command for file: {path}")
-                                # Direct playback of the temp MP3 file
                 tllogger.debug(f"Invoking Audio.play for file: {path} (positional)")
-                        await ctx.invoke(play_cmd, path)
-                        tllogger.debug("Audio.play command invoked successfully.")
+                await ctx.invoke(play_cmd, path)
                 tllogger.debug("Audio.play command invoked successfully.")
             except Exception:
                 tllogger.exception("Exception during Audio.play invocation.")
             finally:
-                if path:
-                    try:
-                        os.unlink(path)
-                        tllogger.debug(f"Deleted temp file: {path}")
-                    except Exception:
-                        tllogger.exception("Failed to delete temp file.")
+                try:
+                    os.unlink(path)
+                    tllogger.debug(f"Deleted temp file: {path}")
+                except Exception:
+                    tllogger.exception("Failed to delete temp file.")
 
     @commands.group(name="deepseek", aliases=["ds"])
     @commands.is_owner()
@@ -166,6 +161,7 @@ class AprilAI(commands.Cog):
         """Configure DeepSeek AI settings"""
         pass
 
+    # Configuration commands...
     @deepseek.command()
     async def apikey(self, ctx, key: str):
         await self.config.deepseek_key.set(key)
@@ -211,48 +207,6 @@ class AprilAI(commands.Cog):
         e.add_field(name="Max Tokens", value=str(cfg['max_tokens']), inline=True)
         e.add_field(name="System Prompt", value=f"```{cfg['system_prompt']}```", inline=False)
         await ctx.send(embed=e)
-
-    async def query_deepseek(self, user_id: int, question: str, ctx):
-        key = await self.config.deepseek_key()
-        if not key:
-            raise Exception("DeepSeek key not set.")
-        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-        payload = {
-            "model": await self.config.model(),
-            "messages": [
-                {"role": "system", "content": await self.config.system_prompt()},
-                {"role": "user", "content": f"[User:{ctx.author.display_name}] {question}"}
-            ],
-            "temperature": await self.config.temperature(),
-            "max_tokens": await self.config.max_tokens(),
-            "user": str(user_id)
-        }
-        async with self.session.post(
-            "https://api.deepseek.com/v1/chat/completions",
-            json=payload, headers=headers, timeout=30
-        ) as r:
-            data = await r.json()
-            if r.status != 200:
-                err = data.get("error", {}).get("message", "Unknown")
-                raise Exception(f"API {r.status}: {err}")
-            return data["choices"][0]["message"]["content"].strip()
-
-    async def send_text_response(self, ctx, response: str):
-        if len(response) > 1900:
-            pages = list(pagify(response, delims=["\n", " "], priority=True, page_length=1500))
-            await menu(ctx, pages, DEFAULT_CONTROLS)
-        else:
-            await ctx.send(response)
-
-    @commands.Cog.listener()
-    async def on_voice_state_update(self, member, before, after):
-        # auto-disconnect if alone
-        if member.bot:
-            return
-        vc = member.guild.voice_client
-        if vc and len(vc.channel.members) == 1:
-            await vc.disconnect()
-            self.active_tts_tasks.pop(member.guild.id, None)
 
 async def setup(bot):
     await bot.add_cog(AprilAI(bot))
