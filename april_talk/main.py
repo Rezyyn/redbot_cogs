@@ -11,7 +11,6 @@ from redbot.core.utils.menus import menu, DEFAULT_CONTROLS
 
 # Initialize logger for this Cog
 tllogger = logging.getLogger("red.aprilai")
-
 tllogger.setLevel(logging.DEBUG)
 
 class AprilAI(commands.Cog):
@@ -95,31 +94,30 @@ class AprilAI(commands.Cog):
                 if not (use_voice and not await self.config.text_response_when_voice()):
                     await self.send_text_response(ctx, resp)
                 if use_voice:
-                    await self.speak_response(ctx.guild, resp)
-            except Exception as e:
+                    await self.speak_response(ctx, resp)
+            except Exception:
                 tllogger.exception("Error in process_query")
                 await ctx.send(f"❌ Error: {e}")
 
-    async def speak_response(self, guild, text: str):
-        """Schedule TTS playback via temporary file."""
+    async def speak_response(self, ctx, text: str):
+        """Schedule TTS playback via Redbot Audio cog."""
+        guild = ctx.guild
         tllogger.debug(f"Scheduling TTS for guild: {guild.id}")
         tts_key = await self.config.tts_key()
         if not tts_key:
             tllogger.warning("No TTS key set; skipping TTS.")
             return
-        vc = guild.voice_client
-        if not vc:
-            tllogger.warning("No voice client available for TTS.")
-            return
+        # cancel old
         if guild.id in self.active_tts_tasks:
             self.active_tts_tasks[guild.id].cancel()
-        task = asyncio.create_task(self._play_tts(vc, tts_key, await self.config.voice_id(), text))
+        task = asyncio.create_task(self._play_tts(ctx, tts_key, await self.config.voice_id(), text))
         self.active_tts_tasks[guild.id] = task
 
-    async def _play_tts(self, voice_client, tts_key, voice_id, text: str):
-        """Fetch MP3 from ElevenLabs, save to temp file, and play."""
+    async def _play_tts(self, ctx, tts_key, voice_id, text: str):
+        """Fetch MP3 from ElevenLabs, save to temp file, then invoke Audio.play."""
         tllogger.debug("_play_tts started.")
         chunks = [text[i:i+2000] for i in range(0, len(text), 2000)]
+        play_cmd = self.bot.get_command("play")
         for idx, chunk in enumerate(chunks, 1):
             if not chunk.strip():
                 continue
@@ -143,18 +141,22 @@ class AprilAI(commands.Cog):
 
             path = None
             try:
+                # write temp file
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tf:
                     tf.write(data)
                     path = tf.name
                 tllogger.debug(f"Wrote TTS to temp file: {path}")
-                source = discord.FFmpegPCMAudio(path, before_options="-loglevel warning")
-                voice_client.play(source)
-                tllogger.debug("Playing TTS audio...")
-                while voice_client.is_playing():
+                # invoke Audio.play
+                tllogger.debug(f"Invoking play command for file: {path}")
+                await ctx.invoke(play_cmd, path)
+                tllogger.debug("Play command invoked.")
+                # wait until finished
+                vc = ctx.guild.voice_client
+                while vc and vc.is_playing():
                     await asyncio.sleep(0.1)
-                tllogger.debug("TTS playback finished.")
+                tllogger.debug("Audio.play finished playback.")
             except Exception:
-                tllogger.exception("Exception during TTS playback.")
+                tllogger.exception("Exception during Audio.play invocation.")
             finally:
                 if path:
                     try:
