@@ -139,13 +139,23 @@ class AprilAI(commands.Cog):
                     path = tf.name
                 tllogger.debug(f"Saved TTS to {path}")
 
-                # Play via FFmpegPCMAudio
-                source = discord.FFmpegPCMAudio(path)
-                voice_client.play(source)
-                tllogger.debug("Playing TTS via FFmpegPCMAudio.")
-                while voice_client.is_playing():
-                    await asyncio.sleep(0.1)
-                tllogger.debug("TTS playback complete.")
+                                # Play via Lavalink local file support
+                try:
+                    file_url = f"file://{path}"
+                    tllogger.debug(f"Loading local file via Lavalink: {file_url}")
+                    node = self.bot.lavalink.get_node()
+                    load = await node.get_tracks(file_url)
+                    if load.tracks:
+                        track = load.tracks[0]
+                        tllogger.debug(f"Playing track: {track.info.title}")
+                        await voice_client.play(track)
+                        while voice_client.is_playing():
+                            await asyncio.sleep(0.1)
+                        tllogger.debug("Lavalink playback complete.")
+                    else:
+                        tllogger.error("No tracks loaded for playback.")
+                except Exception:
+                    tllogger.exception("Lavalink playback failed.")
             except Exception:
                 tllogger.exception("Error during TTS playback")
             finally:
