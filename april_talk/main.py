@@ -95,7 +95,7 @@ class AprilAI(commands.Cog):
                     await self.send_text_response(ctx, resp)
                 if use_voice:
                     await self.speak_response(ctx, resp)
-            except Exception:
+            except Exception as e:
                 tllogger.exception("Error in process_query")
                 await ctx.send(f"❌ Error: {e}")
 
@@ -107,7 +107,6 @@ class AprilAI(commands.Cog):
         if not tts_key:
             tllogger.warning("No TTS key set; skipping TTS.")
             return
-        # cancel old
         if guild.id in self.active_tts_tasks:
             self.active_tts_tasks[guild.id].cancel()
         task = asyncio.create_task(self._play_tts(ctx, tts_key, await self.config.voice_id(), text))
@@ -141,16 +140,13 @@ class AprilAI(commands.Cog):
 
             path = None
             try:
-                # write temp file
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tf:
                     tf.write(data)
                     path = tf.name
                 tllogger.debug(f"Wrote TTS to temp file: {path}")
-                # invoke Audio.play
                 tllogger.debug(f"Invoking play command for file: {path}")
-                await ctx.invoke(play_cmd, search=path)
+                await ctx.invoke(play_cmd, source=path)
                 tllogger.debug("Play command invoked.")
-                # wait until finished
                 vc = ctx.guild.voice_client
                 while vc and vc.is_playing():
                     await asyncio.sleep(0.1)
