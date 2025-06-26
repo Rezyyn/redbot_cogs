@@ -4,6 +4,7 @@ import discord
 import tempfile
 import os
 import logging
+from collections import deque
 from redbot.core import commands, Config
 from redbot.core.bot import Red
 from redbot.core.utils.chat_formatting import pagify
@@ -20,6 +21,8 @@ class AprilAI(commands.Cog):
         self.bot = bot
         self.config = Config.get_conf(self, identifier=1398462)
         self.session = aiohttp.ClientSession()
+        # Per-channel conversation history {channel_id: deque}
+        self.history = {}
         self.config.register_global(
             deepseek_key="",
             tts_key="",
@@ -29,7 +32,8 @@ class AprilAI(commands.Cog):
             max_tokens=2048,
             system_prompt="You are April...",
             tts_enabled=True,
-            text_response_when_voice=True
+            text_response_when_voice=True,
+            max_history=5  # Default 5 exchanges
         )
 
     def cog_unload(self):
@@ -55,8 +59,18 @@ class AprilAI(commands.Cog):
             return await self.join_voice(ctx)
         if cmd == "leave":
             return await self.leave_voice(ctx)
+        if cmd == "clearhistory":
+            return await self.clear_history(ctx)
         tllogger.debug(f"Command april: {input} by {ctx.author}")
         await self.process_query(ctx, input)
+
+    @april.command(name="clearhistory")
+    async def clear_history(self, ctx):
+        """Clear conversation history for this channel"""
+        channel_id = ctx.channel.id
+        if channel_id in self.history:
+            self.history[channel_id].clear()
+        await ctx.send("✅ Conversation history cleared for this channel.")
 
     async def join_voice(self, ctx):
         """Join voice channel using Red's audio system"""
@@ -126,7 +140,25 @@ class AprilAI(commands.Cog):
         tllogger.debug(f"process_query use_voice={use_voice}")
         async with ctx.typing():
             try:
-                resp = await self.query_deepseek(ctx.author.id, input_text, ctx)
+                # Get or create history for this channel
+                channel_id = ctx.channel.id
+                if channel_id not in self.history:
+                    max_history = await self.config.max_history()
+                    self.history[channel_id] = deque(maxlen=max_history * 2)  # 2 messages per exchange
+                
+                # Build message history
+                messages = [
+                    {"role": "system", "content": await self.config.system_prompt()}
+                ]
+                messages.extend(self.history[channel_id])
+                messages.append({"role": "user", "content": input_text})
+                
+                resp = await self.query_deepseek(ctx.author.id, messages)
+                
+                # Update history with new exchange
+                self.history[channel_id].append({"role": "user", "content": input_text})
+                self.history[channel_id].append({"role": "assistant", "content": resp})
+                
                 if not (use_voice and not await self.config.text_response_when_voice()):
                     await self.send_text_response(ctx, resp)
                 if use_voice:
@@ -294,6 +326,18 @@ class AprilAI(commands.Cog):
         await ctx.send(f"✅ Text responses will be {status} when using voice")
     
     @aprilconfig.command()
+    async def maxhistory(self, ctx, num: int):
+        """Set max conversation history exchanges (1-20)"""
+        if 1 <= num <= 20:
+            await self.config.max_history.set(num)
+            # Update existing history maxlen
+            for channel_id in self.history:
+                self.history[channel_id] = deque(self.history[channel_id], maxlen=num*2)
+            await ctx.send(f"✅ Max history set to `{num}` exchanges")
+        else:
+            await ctx.send("❌ Value must be between 1 and 20")
+    
+    @aprilconfig.command()
     async def settings(self, ctx):
         """Show current configuration"""
         cfg = await self.config.all()
@@ -309,6 +353,7 @@ class AprilAI(commands.Cog):
         e.add_field(name="Model", value=f"`{cfg['model']}`", inline=True)
         e.add_field(name="Temperature", value=f"`{cfg['temperature']}`", inline=True)
         e.add_field(name="Max Tokens", value=f"`{cfg['max_tokens']}`", inline=True)
+        e.add_field(name="Max History", value=f"`{cfg['max_history']} exchanges`", inline=True)
         e.add_field(name="TTS Enabled", value="✅" if cfg['tts_enabled'] else "❌", inline=True)
         e.add_field(name="Text with Voice", value="✅" if cfg['text_response_when_voice'] else "❌", inline=True)
         
@@ -317,7 +362,7 @@ class AprilAI(commands.Cog):
         
         await ctx.send(embed=e)
 
-    async def query_deepseek(self, user_id: int, question: str, ctx):
+    async def query_deepseek(self, user_id: int, messages: list):
         key = await self.config.deepseek_key()
         if not key: 
             raise Exception("DeepSeek API key not set. Use `[p]aprilconfig deepseekkey <key>`")
@@ -325,10 +370,7 @@ class AprilAI(commands.Cog):
         headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
         payload = {
             "model": await self.config.model(),
-            "messages": [
-                {"role": "system", "content": await self.config.system_prompt()},
-                {"role": "user", "content": question}
-            ],
+            "messages": messages,
             "temperature": await self.config.temperature(),
             "max_tokens": await self.config.max_tokens(),
             "user": str(user_id)
