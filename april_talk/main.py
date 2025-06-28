@@ -5,7 +5,6 @@ import os
 import logging
 import random
 import time
-import json
 from collections import deque
 from pathlib import Path
 from redbot.core import commands, Config
@@ -17,6 +16,13 @@ from redbot.core.utils.menus import menu, DEFAULT_CONTROLS
 # Logger
 tllogger = logging.getLogger("red.aprilai")
 tllogger.setLevel(logging.DEBUG)
+
+try:
+    import lavalink
+    LAVALINK_AVAILABLE = True
+except ImportError:
+    LAVALINK_AVAILABLE = False
+    tllogger.warning("Lavalink not available. Audio features disabled.")
 
 class AprilAI(commands.Cog):
     """AI assistant with text and voice via Lavalink"""
@@ -31,6 +37,7 @@ class AprilAI(commands.Cog):
         self.tts_files = set()
         self._unloading = False
         self.lavalink = None
+        self._init_task = None
         
         # Create TTS directory using cog-specific path
         self.tts_dir = Path(cog_data_path(self)) / "tts"
@@ -49,50 +56,77 @@ class AprilAI(commands.Cog):
             max_history=5  # Default 5 exchanges
         )
         
-        # Initialize Lavalink connection
-        bot.loop.create_task(self.initialize_lavalink())
+        # Start initialization task
+        if LAVALINK_AVAILABLE:
+            self._init_task = bot.loop.create_task(self.initialize_lavalink())
 
     async def initialize_lavalink(self):
-        """Initialize Lavalink connection"""
-        # Wait until bot is ready
-        await self.bot.wait_until_red_ready()
+        """Initialize Lavalink connection with retries"""
+        max_retries = 10
+        retry_delay = 5
         
-        # Get Lavalink connection info from Audio cog
-        audio_cog = self.bot.get_cog("Audio")
-        if not audio_cog:
-            tllogger.error("Audio cog not loaded!")
-            return
+        for attempt in range(1, max_retries + 1):
+            try:
+                tllogger.debug(f"Initializing Lavalink (attempt {attempt}/{max_retries})")
+                
+                # Wait until bot is ready
+                await self.bot.wait_until_red_ready()
+                
+                # Get Audio cog
+                audio_cog = self.bot.get_cog("Audio")
+                if not audio_cog:
+                    tllogger.warning("Audio cog not loaded yet. Waiting...")
+                    await asyncio.sleep(retry_delay)
+                    continue
+                
+                # Get Lavalink credentials
+                host = await audio_cog.config.host()
+                password = await audio_cog.config.password()
+                rest_port = await audio_cog.config.rest_port()
+                ws_port = await audio_cog.config.ws_port()
+                
+                if not host or not password:
+                    tllogger.warning("Lavalink credentials not available yet. Waiting...")
+                    await asyncio.sleep(retry_delay)
+                    continue
+                
+                tllogger.debug(f"Using Lavalink at {host}:{ws_port}")
+                
+                # Create Lavalink client
+                self.lavalink = lavalink.Client(self.bot.user.id)
+                
+                node = lavalink.Node(
+                    host=host,
+                    port=ws_port,
+                    password=password,
+                    rest_uri=f"http://{host}:{rest_port}",
+                    region='us-central'
+                )
+                
+                await self.lavalink.add_node(node)
+                
+                # Test connection
+                if self.lavalink.node.connected:
+                    tllogger.info("Lavalink client initialized successfully!")
+                    return
+                else:
+                    tllogger.warning("Lavalink connected but node not marked as connected. Retrying...")
+                    
+            except Exception as e:
+                tllogger.error(f"Lavalink initialization failed (attempt {attempt}): {e}")
             
-        # Get Lavalink credentials
-        host = await audio_cog.config.host()
-        password = await audio_cog.config.password()
-        rest_port = await audio_cog.config.rest_port()
-        ws_port = await audio_cog.config.ws_port()
+            await asyncio.sleep(retry_delay)
         
-        if not host or not password:
-            tllogger.error("Lavalink credentials not configured!")
-            return
-            
-        # Create Lavalink client
-        try:
-            from lavalink import Client, Node
-            self.lavalink = Client(self.bot.user.id)
-            
-            node = Node(
-                host=host,
-                port=ws_port,
-                password=password,
-                rest_uri=f"http://{host}:{rest_port}"
-            )
-            
-            await self.lavalink.add_node(node)
-            tllogger.info("Lavalink client initialized successfully!")
-        except Exception as e:
-            tllogger.error(f"Failed to initialize Lavalink: {e}")
-            self.lavalink = None
+        tllogger.error("Failed to initialize Lavalink after multiple attempts")
+        self.lavalink = None
 
     def cog_unload(self):
         self._unloading = True
+        
+        # Cancel initialization task if running
+        if self._init_task and not self._init_task.done():
+            self._init_task.cancel()
+            
         tllogger.debug("Unloading AprilAI, closing session and cleaning up TTS files.")
         self.bot.loop.create_task(self.session.close())
         
@@ -113,8 +147,8 @@ class AprilAI(commands.Cog):
 
     async def get_player(self, guild_id):
         """Get or create Lavalink player for a guild"""
-        if not self.lavalink:
-            tllogger.warning("Lavalink not initialized")
+        if not self.lavalink or not self.lavalink.node.connected:
+            tllogger.warning("Lavalink not initialized or not connected")
             return None
             
         player = self.lavalink.player_manager.get(guild_id)
@@ -154,6 +188,14 @@ class AprilAI(commands.Cog):
         """Join voice channel directly using Lavalink"""
         tllogger.debug("join_voice invoked")
         
+        if not self.lavalink or not self.lavalink.node.connected:
+            # Try to initialize on demand
+            tllogger.debug("Lavalink not ready, attempting initialization")
+            await self.initialize_lavalink()
+            
+            if not self.lavalink or not self.lavalink.node.connected:
+                return await ctx.send("❌ Audio system not available. Lavalink is not initialized.")
+        
         # Check user voice state
         if not ctx.author.voice or not ctx.author.voice.channel:
             return await ctx.send("❌ You must be in a voice channel.")
@@ -180,7 +222,7 @@ class AprilAI(commands.Cog):
                 await ctx.send("✅ Already in your voice channel")
         except Exception as e:
             tllogger.exception("Failed join_voice")
-            await ctx.send(f"❌ Join failed: {e}")
+            await ctx.send(f"❌ Join failed: {e}"
 
     async def leave_voice(self, ctx):
         player = await self.get_player(ctx.guild.id)
