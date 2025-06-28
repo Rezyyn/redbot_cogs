@@ -9,7 +9,7 @@ from collections import deque
 from pathlib import Path
 from redbot.core import commands, Config
 from redbot.core.bot import Red
-from redbot.core.data_manager import temp_data_path
+from redbot.core.data_manager import cog_data_path
 from redbot.core.utils.chat_formatting import pagify
 from redbot.core.utils.menus import menu, DEFAULT_CONTROLS
 
@@ -29,8 +29,9 @@ class AprilAI(commands.Cog):
         # Track TTS files for cleanup
         self.tts_files = set()
         self._unloading = False
-        # Create TTS directory
-        self.tts_dir = temp_data_path() / "aprilai_tts"
+        
+        # Create TTS directory using cog-specific path
+        self.tts_dir = Path(cog_data_path(self)) / "tts"
         self.tts_dir.mkdir(exist_ok=True, parents=True)
         
         self.config.register_global(
@@ -53,7 +54,8 @@ class AprilAI(commands.Cog):
         # Clean up any remaining TTS files
         for path in list(self.tts_files):
             try:
-                os.unlink(path)
+                if os.path.exists(path):
+                    os.unlink(path)
                 tllogger.debug(f"Cleaned up TTS file on unload: {path}")
             except Exception as e:
                 tllogger.error(f"Error cleaning up TTS file {path}: {e}")
@@ -224,7 +226,7 @@ class AprilAI(commands.Cog):
                     resp.raise_for_status()
                     data = await resp.read()
                 
-                # Create file in bot's temp directory
+                # Create file in cog's TTS directory
                 filename = f"tts_{int(time.time())}_{random.randint(0, 10000)}.mp3"
                 path = str(self.tts_dir / filename)
                 with open(path, "wb") as f:
