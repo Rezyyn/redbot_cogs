@@ -67,10 +67,30 @@ class AprilAI(commands.Cog):
     
     async def get_player_manager(self, audio_cog):
         """Get player manager safely from Audio cog"""
-        if hasattr(audio_cog, "lavalink") and audio_cog.lavalink:
-            return audio_cog.lavalink.player_manager
-        elif hasattr(audio_cog, "_player_manager"):
-            return audio_cog._player_manager
+        if not audio_cog:
+            return None
+            
+        # Try multiple ways to access the player manager
+        try:
+            # Method 1: Lavalink-based player manager
+            if hasattr(audio_cog, "lavalink") and audio_cog.lavalink:
+                return audio_cog.lavalink.player_manager
+            
+            # Method 2: Direct player manager attribute
+            if hasattr(audio_cog, "_player_manager"):
+                return audio_cog._player_manager
+                
+            # Method 3: API-based player manager
+            if hasattr(audio_cog, "_api"):
+                return audio_cog._api.player_manager
+                
+            # Method 4: Check if player manager is callable
+            if callable(getattr(audio_cog, "player_manager", None)):
+                return audio_cog.player_manager()
+                
+        except Exception as e:
+            tllogger.error(f"Error getting player manager: {e}")
+            
         return None
 
     @commands.group(name="april", invoke_without_command=True)
@@ -111,8 +131,15 @@ class AprilAI(commands.Cog):
             if not permissions.connect or not permissions.speak:
                 return await ctx.send("❌ I need permissions to connect and speak!")
             
-            # Get player manager
-            player_manager = await self.get_player_manager(audio_cog)
+            # Get player manager with retry
+            player_manager = None
+            for attempt in range(3):  # Try up to 3 times
+                player_manager = await self.get_player_manager(audio_cog)
+                if player_manager:
+                    break
+                tllogger.debug(f"Audio system not ready, attempt {attempt+1}/3")
+                await asyncio.sleep(0.5)
+            
             if not player_manager:
                 return await ctx.send("❌ Audio system not ready. Try again in a moment.")
             
@@ -121,15 +148,27 @@ class AprilAI(commands.Cog):
             if not player:
                 # Ensure auto_connect is disabled
                 await audio_cog.config.guild(ctx.guild).auto_connect.set(False)
-                player = await player_manager.create(ctx.guild.id)
+                try:
+                    player = await player_manager.create(ctx.guild.id)
+                except Exception as e:
+                    tllogger.error(f"Player creation failed: {e}")
+                    return await ctx.send(f"❌ Failed to create player: {e}")
             
             # Connect or move
             if not player.is_connected:
-                await player.connect(channel.id)
-                await ctx.send(f"🔊 Joined {channel.name}")
+                try:
+                    await player.connect(channel.id)
+                    await ctx.send(f"🔊 Joined {channel.name}")
+                except Exception as e:
+                    tllogger.error(f"Connection failed: {e}")
+                    await ctx.send(f"❌ Connection failed: {e}")
             elif player.channel_id != channel.id:
-                await player.move_to(channel.id)
-                await ctx.send(f"🔊 Moved to {channel.name}")
+                try:
+                    await player.move_to(channel.id)
+                    await ctx.send(f"🔊 Moved to {channel.name}")
+                except Exception as e:
+                    tllogger.error(f"Move failed: {e}")
+                    await ctx.send(f"❌ Move failed: {e}")
             else:
                 await ctx.send("✅ Already in your voice channel")
         except Exception as e:
@@ -147,9 +186,13 @@ class AprilAI(commands.Cog):
         
         player = player_manager.get(ctx.guild.id)
         if player and player.is_connected:
-            await player.stop()
-            await player.disconnect()
-            await ctx.send("👋 Disconnected")
+            try:
+                await player.stop()
+                await player.disconnect()
+                await ctx.send("👋 Disconnected")
+            except Exception as e:
+                tllogger.error(f"Disconnect failed: {e}")
+                await ctx.send(f"❌ Disconnect failed: {e}")
         else:
             await ctx.send("❌ Not in a voice channel.")
 
