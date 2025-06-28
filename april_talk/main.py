@@ -1,12 +1,15 @@
 import asyncio
 import aiohttp
 import discord
-import tempfile
 import os
 import logging
+import random
+import time
 from collections import deque
+from pathlib import Path
 from redbot.core import commands, Config
 from redbot.core.bot import Red
+from redbot.core.data_manager import temp_data_path
 from redbot.core.utils.chat_formatting import pagify
 from redbot.core.utils.menus import menu, DEFAULT_CONTROLS
 
@@ -23,6 +26,13 @@ class AprilAI(commands.Cog):
         self.session = aiohttp.ClientSession()
         # Per-channel conversation history {channel_id: deque}
         self.history = {}
+        # Track TTS files for cleanup
+        self.tts_files = set()
+        self._unloading = False
+        # Create TTS directory
+        self.tts_dir = temp_data_path() / "aprilai_tts"
+        self.tts_dir.mkdir(exist_ok=True, parents=True)
+        
         self.config.register_global(
             deepseek_key="",
             tts_key="",
@@ -37,8 +47,18 @@ class AprilAI(commands.Cog):
         )
 
     def cog_unload(self):
-        tllogger.debug("Unloading AprilAI, closing session.")
+        self._unloading = True
+        tllogger.debug("Unloading AprilAI, closing session and cleaning up TTS files.")
         self.bot.loop.create_task(self.session.close())
+        # Clean up any remaining TTS files
+        for path in list(self.tts_files):
+            try:
+                os.unlink(path)
+                tllogger.debug(f"Cleaned up TTS file on unload: {path}")
+            except Exception as e:
+                tllogger.error(f"Error cleaning up TTS file {path}: {e}")
+            finally:
+                self.tts_files.discard(path)
 
     async def get_audio_cog(self):
         return self.bot.get_cog("Audio")
@@ -204,10 +224,13 @@ class AprilAI(commands.Cog):
                     resp.raise_for_status()
                     data = await resp.read()
                 
-                # Create temporary file
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tf:
-                    tf.write(data)
-                    temp_files.append(tf.name)
+                # Create file in bot's temp directory
+                filename = f"tts_{int(time.time())}_{random.randint(0, 10000)}.mp3"
+                path = str(self.tts_dir / filename)
+                with open(path, "wb") as f:
+                    f.write(data)
+                temp_files.append(path)
+                self.tts_files.add(path)
             
             # Add tracks to player
             for path in temp_files:
@@ -237,25 +260,31 @@ class AprilAI(commands.Cog):
             if not player.is_playing:
                 await player.play()
             
-            # Schedule cleanup
-            async def cleanup():
-                await asyncio.sleep(60)
-                for path in temp_files:
-                    try:
-                        os.unlink(path)
-                        tllogger.debug(f"Cleaned up TTS file: {path}")
-                    except:
-                        pass
-            self.bot.loop.create_task(cleanup())
-            
         except Exception:
             tllogger.exception("TTS processing error")
             # Clean up any created files immediately on error
             for path in temp_files:
                 try:
-                    os.unlink(path)
+                    if os.path.exists(path):
+                        os.unlink(path)
+                    self.tts_files.discard(path)
                 except:
                     pass
+
+    @commands.Cog.listener()
+    async def on_red_audio_track_end(self, guild, track, reason):
+        """Clean up TTS files after playback"""
+        if self._unloading:
+            return
+            
+        if hasattr(track, 'uri') and track.uri in self.tts_files:
+            try:
+                if os.path.exists(track.uri):
+                    os.unlink(track.uri)
+                self.tts_files.discard(track.uri)
+                tllogger.debug(f"Cleaned up TTS file: {track.uri}")
+            except Exception as e:
+                tllogger.error(f"Error cleaning up TTS file {track.uri}: {e}")
 
     @commands.group(name="aprilconfig", aliases=["aprilcfg"])
     @commands.is_owner()
