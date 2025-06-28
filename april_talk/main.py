@@ -222,7 +222,7 @@ class AprilAI(commands.Cog):
                 await ctx.send("✅ Already in your voice channel")
         except Exception as e:
             tllogger.exception("Failed join_voice")
-            await ctx.send(f"❌ Join failed: {e}"
+            await ctx.send(f"❌ Join failed: {e}")
 
     async def leave_voice(self, ctx):
         player = await self.get_player(ctx.guild.id)
