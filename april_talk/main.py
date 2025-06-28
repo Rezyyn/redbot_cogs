@@ -63,35 +63,49 @@ class AprilAI(commands.Cog):
                 self.tts_files.discard(path)
 
     async def get_audio_cog(self):
-        return self.bot.get_cog("Audio")
+        """Get audio cog with retry mechanism"""
+        for _ in range(5):
+            audio_cog = self.bot.get_cog("Audio")
+            if audio_cog and hasattr(audio_cog, "lavalink"):
+                return audio_cog
+            await asyncio.sleep(0.5)
+        return None
     
     async def get_player_manager(self, audio_cog):
         """Get player manager safely from Audio cog"""
         if not audio_cog:
             return None
             
-        # Try multiple ways to access the player manager
-        try:
-            # Method 1: Lavalink-based player manager
+        # Wait for lavalink to be ready
+        for _ in range(10):
             if hasattr(audio_cog, "lavalink") and audio_cog.lavalink:
                 return audio_cog.lavalink.player_manager
-            
-            # Method 2: Direct player manager attribute
-            if hasattr(audio_cog, "_player_manager"):
-                return audio_cog._player_manager
-                
-            # Method 3: API-based player manager
-            if hasattr(audio_cog, "_api"):
-                return audio_cog._api.player_manager
-                
-            # Method 4: Check if player manager is callable
-            if callable(getattr(audio_cog, "player_manager", None)):
-                return audio_cog.player_manager()
-                
-        except Exception as e:
-            tllogger.error(f"Error getting player manager: {e}")
-            
+            await asyncio.sleep(0.5)
         return None
+
+    async def get_player(self, ctx):
+        """Get or create player with proper initialization"""
+        audio_cog = await self.get_audio_cog()
+        if not audio_cog:
+            return None
+            
+        player_manager = await self.get_player_manager(audio_cog)
+        if not player_manager:
+            return None
+            
+        # Get or create player
+        player = player_manager.get(ctx.guild.id)
+        if not player:
+            # Ensure auto_connect is disabled
+            await audio_cog.config.guild(ctx.guild).auto_connect.set(False)
+            try:
+                player = await player_manager.create(ctx.guild.id)
+                tllogger.debug("Created new player instance")
+            except Exception as e:
+                tllogger.error(f"Player creation failed: {e}")
+                return None
+                
+        return player
 
     @commands.group(name="april", invoke_without_command=True)
     @commands.cooldown(1, 15, commands.BucketType.user)
@@ -117,58 +131,29 @@ class AprilAI(commands.Cog):
     async def join_voice(self, ctx):
         """Join voice channel using Red's audio system"""
         tllogger.debug("join_voice invoked")
-        audio_cog = await self.get_audio_cog()
-        if not audio_cog:
-            return await ctx.send("❌ Audio cog is not loaded. Load it with `[p]load audio`")
+        
+        # Check user voice state
+        if not ctx.author.voice or not ctx.author.voice.channel:
+            return await ctx.send("❌ You must be in a voice channel.")
+        
+        channel = ctx.author.voice.channel
+        permissions = channel.permissions_for(ctx.me)
+        if not permissions.connect or not permissions.speak:
+            return await ctx.send("❌ I need permissions to connect and speak!")
+        
+        # Get player instance
+        player = await self.get_player(ctx)
+        if not player:
+            return await ctx.send("❌ Audio system not ready. Try again in a moment.")
         
         try:
-            # Check user voice state
-            if not ctx.author.voice or not ctx.author.voice.channel:
-                return await ctx.send("❌ You must be in a voice channel.")
-            
-            channel = ctx.author.voice.channel
-            permissions = channel.permissions_for(ctx.me)
-            if not permissions.connect or not permissions.speak:
-                return await ctx.send("❌ I need permissions to connect and speak!")
-            
-            # Get player manager with retry
-            player_manager = None
-            for attempt in range(3):  # Try up to 3 times
-                player_manager = await self.get_player_manager(audio_cog)
-                if player_manager:
-                    break
-                tllogger.debug(f"Audio system not ready, attempt {attempt+1}/3")
-                await asyncio.sleep(0.5)
-            
-            if not player_manager:
-                return await ctx.send("❌ Audio system not ready. Try again in a moment.")
-            
-            # Get or create player
-            player = player_manager.get(ctx.guild.id)
-            if not player:
-                # Ensure auto_connect is disabled
-                await audio_cog.config.guild(ctx.guild).auto_connect.set(False)
-                try:
-                    player = await player_manager.create(ctx.guild.id)
-                except Exception as e:
-                    tllogger.error(f"Player creation failed: {e}")
-                    return await ctx.send(f"❌ Failed to create player: {e}")
-            
             # Connect or move
             if not player.is_connected:
-                try:
-                    await player.connect(channel.id)
-                    await ctx.send(f"🔊 Joined {channel.name}")
-                except Exception as e:
-                    tllogger.error(f"Connection failed: {e}")
-                    await ctx.send(f"❌ Connection failed: {e}")
+                await player.connect(channel.id)
+                await ctx.send(f"🔊 Joined {channel.name}")
             elif player.channel_id != channel.id:
-                try:
-                    await player.move_to(channel.id)
-                    await ctx.send(f"🔊 Moved to {channel.name}")
-                except Exception as e:
-                    tllogger.error(f"Move failed: {e}")
-                    await ctx.send(f"❌ Move failed: {e}")
+                await player.move_to(channel.id)
+                await ctx.send(f"🔊 Moved to {channel.name}")
             else:
                 await ctx.send("✅ Already in your voice channel")
         except Exception as e:
@@ -176,15 +161,10 @@ class AprilAI(commands.Cog):
             await ctx.send(f"❌ Join failed: {e}")
 
     async def leave_voice(self, ctx):
-        audio_cog = await self.get_audio_cog()
-        if not audio_cog:
-            return await ctx.send("❌ Audio cog is not loaded. Load it with `[p]load audio`")
-        
-        player_manager = await self.get_player_manager(audio_cog)
-        if not player_manager:
+        player = await self.get_player(ctx)
+        if not player:
             return await ctx.send("❌ Audio system not ready.")
         
-        player = player_manager.get(ctx.guild.id)
         if player and player.is_connected:
             try:
                 await player.stop()
@@ -197,9 +177,8 @@ class AprilAI(commands.Cog):
             await ctx.send("❌ Not in a voice channel.")
 
     async def process_query(self, ctx, input_text):
-        audio_cog = await self.get_audio_cog()
-        player_manager = await self.get_player_manager(audio_cog) if audio_cog else None
-        player = player_manager.get(ctx.guild.id) if player_manager else None
+        # Get player instance
+        player = await self.get_player(ctx)
         use_voice = await self.config.tts_enabled() and player and player.is_connected
         
         tllogger.debug(f"process_query use_voice={use_voice}")
@@ -238,15 +217,8 @@ class AprilAI(commands.Cog):
             tllogger.warning("Skipping TTS: missing API key.")
             return
         
-        audio_cog = await self.get_audio_cog()
-        if not audio_cog:
-            return
-        
-        player_manager = await self.get_player_manager(audio_cog)
-        if not player_manager:
-            return
-        
-        player = player_manager.get(ctx.guild.id)
+        # Get player instance
+        player = await self.get_player(ctx)
         if not player or not player.is_connected:
             tllogger.warning("Skipping TTS: Player not connected.")
             return
@@ -280,6 +252,10 @@ class AprilAI(commands.Cog):
             # Add tracks to player
             for path in temp_files:
                 # Use Audio cog's method to get tracks
+                audio_cog = await self.get_audio_cog()
+                if not audio_cog:
+                    continue
+                    
                 if hasattr(audio_cog, '_audio_query_client'):
                     tracks = await audio_cog._audio_query_client.get_tracks(
                         ctx, path, False
