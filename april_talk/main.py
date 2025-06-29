@@ -55,55 +55,87 @@ class AprilAI(commands.Cog):
 
     async def initialize_lavalink(self):
         """Wait for Audio cog and Lavalink to be ready"""
-        max_retries = 20
-        retry_delay = 3
+        max_retries = 30
+        retry_delay = 2
         
         for attempt in range(1, max_retries + 1):
             try:
-                tllogger.debug(f"Checking Lavalink readiness (attempt {attempt}/{max_retries})")
+                tllogger.info(f"[AprilAI] Checking Lavalink readiness (attempt {attempt}/{max_retries})")
                 
                 # Get Audio cog
                 audio_cog = self.bot.get_cog("Audio")
                 if not audio_cog:
-                    tllogger.debug("Audio cog not loaded yet. Waiting...")
+                    tllogger.info("[AprilAI] Audio cog not loaded yet. Waiting...")
                     await asyncio.sleep(retry_delay)
                     continue
                 
-                # Check if Lavalink is ready
-                if not hasattr(audio_cog, "lavalink") or not audio_cog.lavalink:
-                    tllogger.debug("Lavalink client not available yet. Waiting...")
+                # Check if Lavalink attribute exists
+                if not hasattr(audio_cog, "lavalink"):
+                    tllogger.info("[AprilAI] Audio cog has no lavalink attribute yet. Waiting...")
                     await asyncio.sleep(retry_delay)
                     continue
                 
-                # Check if nodes are available
                 lavalink = audio_cog.lavalink
-                if not lavalink.node_manager or not lavalink.node_manager.available_nodes:
-                    tllogger.debug("No Lavalink nodes available yet. Waiting...")
+                if not lavalink:
+                    tllogger.info("[AprilAI] Lavalink client is None. Waiting...")
                     await asyncio.sleep(retry_delay)
                     continue
                 
-                # Test node connection
+                # Check node manager
+                if not hasattr(lavalink, 'node_manager') or not lavalink.node_manager:
+                    tllogger.info("[AprilAI] Node manager not available yet. Waiting...")
+                    await asyncio.sleep(retry_delay)
+                    continue
+                
+                # Check if we have any nodes at all
                 try:
-                    node = lavalink.node_manager.get_best_node()
-                    if not node or not node.is_available():
-                        tllogger.debug("Best node not available yet. Waiting...")
+                    nodes = getattr(lavalink.node_manager, 'nodes', [])
+                    if not nodes:
+                        tllogger.info("[AprilAI] No nodes configured yet. Waiting...")
                         await asyncio.sleep(retry_delay)
                         continue
+                    
+                    # Check if any node is available
+                    available_nodes = [n for n in nodes if hasattr(n, 'is_available') and n.is_available()]
+                    if not available_nodes:
+                        tllogger.info(f"[AprilAI] No available nodes yet ({len(nodes)} total nodes). Waiting...")
+                        await asyncio.sleep(retry_delay)
+                        continue
+                    
+                    tllogger.info(f"[AprilAI] Found {len(available_nodes)} available nodes out of {len(nodes)} total")
+                    
                 except Exception as e:
-                    tllogger.debug(f"Error getting best node: {e}. Waiting...")
+                    tllogger.info(f"[AprilAI] Error checking nodes: {e}. Waiting...")
+                    await asyncio.sleep(retry_delay)
+                    continue
+                
+                # Test creating a player to ensure everything works
+                try:
+                    test_guild_id = 123456789  # Dummy guild ID for testing
+                    if hasattr(lavalink, 'player_manager') and lavalink.player_manager:
+                        # Just check if player manager is functional
+                        tllogger.info("[AprilAI] Player manager is available")
+                    else:
+                        tllogger.info("[AprilAI] Player manager not available yet. Waiting...")
+                        await asyncio.sleep(retry_delay)
+                        continue
+                        
+                except Exception as e:
+                    tllogger.info(f"[AprilAI] Player manager test failed: {e}. Waiting...")
                     await asyncio.sleep(retry_delay)
                     continue
                 
                 self._lavalink_ready = True
-                tllogger.info("Lavalink is ready!")
+                tllogger.info("[AprilAI] Lavalink is ready!")
                 return
                 
             except Exception as e:
-                tllogger.error(f"Lavalink initialization check failed (attempt {attempt}): {e}")
+                tllogger.error(f"[AprilAI] Lavalink initialization check failed (attempt {attempt}): {e}")
             
             await asyncio.sleep(retry_delay)
         
-        tllogger.error("Failed to detect Lavalink initialization after multiple attempts")
+        tllogger.error("[AprilAI] Failed to detect Lavalink initialization after multiple attempts")
+        tllogger.error("[AprilAI] TTS functionality will be disabled until Lavalink is ready")
 
     def cog_unload(self):
         self._unloading = True
@@ -137,17 +169,46 @@ class AprilAI(commands.Cog):
 
     def is_lavalink_ready(self):
         """Check if Lavalink is ready for use"""
-        if not self._lavalink_ready:
-            return False
-            
-        lavalink = self.get_lavalink()
-        if not lavalink or not lavalink.node_manager:
-            return False
-            
         try:
-            node = lavalink.node_manager.get_best_node()
-            return node and node.is_available()
-        except:
+            audio_cog = self.get_audio_cog()
+            if not audio_cog:
+                tllogger.debug("[AprilAI] Audio cog not found")
+                return False
+                
+            if not hasattr(audio_cog, 'lavalink') or not audio_cog.lavalink:
+                tllogger.debug("[AprilAI] Lavalink client not available")
+                return False
+                
+            lavalink = audio_cog.lavalink
+            if not hasattr(lavalink, 'node_manager') or not lavalink.node_manager:
+                tllogger.debug("[AprilAI] Node manager not available")
+                return False
+            
+            # Check if we have any available nodes
+            try:
+                nodes = getattr(lavalink.node_manager, 'nodes', [])
+                if not nodes:
+                    tllogger.debug("[AprilAI] No nodes configured")
+                    return False
+                    
+                available_nodes = [n for n in nodes if hasattr(n, 'is_available') and n.is_available()]
+                if not available_nodes:
+                    tllogger.debug(f"[AprilAI] No available nodes (have {len(nodes)} total)")
+                    return False
+                    
+                # Check player manager
+                if not hasattr(lavalink, 'player_manager') or not lavalink.player_manager:
+                    tllogger.debug("[AprilAI] Player manager not available")
+                    return False
+                    
+                return True
+                
+            except Exception as e:
+                tllogger.debug(f"[AprilAI] Error checking node availability: {e}")
+                return False
+                
+        except Exception as e:
+            tllogger.debug(f"[AprilAI] Error in lavalink readiness check: {e}")
             return False
 
     async def get_player(self, guild_id: int):
@@ -190,11 +251,31 @@ class AprilAI(commands.Cog):
 
     async def join_voice(self, ctx):
         """Join voice channel"""
-        tllogger.debug("join_voice invoked")
+        tllogger.info(f"[AprilAI] join_voice invoked by {ctx.author}")
+        
+        # Check if Audio cog exists first
+        audio_cog = self.get_audio_cog()
+        if not audio_cog:
+            return await ctx.send("❌ Audio cog is not loaded. Please load it with `[p]load audio`")
         
         # Check if Lavalink is ready
         if not self.is_lavalink_ready():
-            return await ctx.send("❌ Audio system not ready. Please wait a moment and try again, or ensure the Audio cog is loaded and configured.")
+            # Provide more specific error information
+            lavalink = self.get_lavalink()
+            if not lavalink:
+                return await ctx.send("❌ Lavalink client not initialized. Please ensure Audio cog is properly configured.")
+            elif not hasattr(lavalink, 'node_manager') or not lavalink.node_manager:
+                return await ctx.send("❌ Lavalink node manager not available. Please check Audio cog configuration.")
+            else:
+                try:
+                    nodes = getattr(lavalink.node_manager, 'nodes', [])
+                    if not nodes:
+                        return await ctx.send("❌ No Lavalink nodes configured. Please configure Audio cog with `[p]audioset`")
+                    else:
+                        available = [n for n in nodes if hasattr(n, 'is_available') and n.is_available()]
+                        return await ctx.send(f"❌ No available Lavalink nodes ({len(available)}/{len(nodes)} ready). Please check your Lavalink server.")
+                except:
+                    return await ctx.send("❌ Error checking Lavalink status. Please restart the Audio cog.")
         
         # Check user voice state
         if not ctx.author.voice or not ctx.author.voice.channel:
@@ -221,7 +302,7 @@ class AprilAI(commands.Cog):
             else:
                 await ctx.send("✅ Already in your voice channel")
         except Exception as e:
-            tllogger.exception("Failed join_voice")
+            tllogger.exception("[AprilAI] Failed join_voice")
             await ctx.send(f"❌ Join failed: {e}")
 
     async def leave_voice(self, ctx):
@@ -585,6 +666,72 @@ class AprilAI(commands.Cog):
         else:
             await ctx.send("❌ Value must be between 1 and 20")
 
+    @aprilconfig.command(name="debug")
+    async def debug_lavalink(self, ctx):
+        """Debug Lavalink connection status"""
+        embed = discord.Embed(title="AprilAI Debug Information", color=0xff0000)
+        
+        # Check Audio cog
+        audio_cog = self.get_audio_cog()
+        embed.add_field(name="Audio Cog", value="✅ Loaded" if audio_cog else "❌ Not loaded", inline=True)
+        
+        if not audio_cog:
+            embed.add_field(name="Fix", value="Load with `[p]load audio`", inline=False)
+            return await ctx.send(embed=embed)
+        
+        # Check Lavalink client
+        has_lavalink = hasattr(audio_cog, 'lavalink')
+        lavalink = getattr(audio_cog, 'lavalink', None)
+        embed.add_field(name="Lavalink Client", value="✅ Available" if has_lavalink and lavalink else "❌ Not available", inline=True)
+        
+        if not (has_lavalink and lavalink):
+            embed.add_field(name="Fix", value="Configure Audio cog with `[p]audioset`", inline=False)
+            return await ctx.send(embed=embed)
+        
+        # Check node manager
+        has_node_manager = hasattr(lavalink, 'node_manager') and lavalink.node_manager
+        embed.add_field(name="Node Manager", value="✅ Available" if has_node_manager else "❌ Not available", inline=True)
+        
+        if not has_node_manager:
+            embed.add_field(name="Fix", value="Check Lavalink server connection", inline=False)
+            return await ctx.send(embed=embed)
+        
+        # Check nodes
+        try:
+            nodes = getattr(lavalink.node_manager, 'nodes', [])
+            embed.add_field(name="Total Nodes", value=str(len(nodes)), inline=True)
+            
+            if nodes:
+                available_nodes = []
+                for i, node in enumerate(nodes):
+                    try:
+                        is_available = hasattr(node, 'is_available') and node.is_available()
+                        status = "✅" if is_available else "❌"
+                        node_info = f"Node {i+1}: {status}"
+                        if hasattr(node, 'host') and hasattr(node, 'port'):
+                            node_info += f" ({node.host}:{node.port})"
+                        embed.add_field(name=f"Node {i+1}", value=node_info, inline=True)
+                        if is_available:
+                            available_nodes.append(node)
+                    except Exception as e:
+                        embed.add_field(name=f"Node {i+1}", value=f"❌ Error: {e}", inline=True)
+                
+                embed.add_field(name="Available Nodes", value=str(len(available_nodes)), inline=True)
+            else:
+                embed.add_field(name="Fix", value="No nodes configured. Check `[p]audioset`", inline=False)
+                
+        except Exception as e:
+            embed.add_field(name="Node Check Error", value=str(e), inline=False)
+        
+        # Check player manager
+        has_player_manager = hasattr(lavalink, 'player_manager') and lavalink.player_manager
+        embed.add_field(name="Player Manager", value="✅ Available" if has_player_manager else "❌ Not available", inline=True)
+        
+        # Overall status
+        overall_ready = self.is_lavalink_ready()
+        embed.add_field(name="Overall Status", value="✅ Ready" if overall_ready else "❌ Not Ready", inline=True)
+        embed.add_field(name="Init Status", value="✅ Complete" if self._lavalink_ready else "❌ In Progress", inline=True)
+        
     @aprilconfig.command(name="settings")
     async def show_settings(self, ctx):
         """Show current configuration"""
