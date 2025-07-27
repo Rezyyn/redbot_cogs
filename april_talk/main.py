@@ -7,6 +7,7 @@ import logging
 import random
 import time
 import tempfile
+import base64
 from collections import deque
 from pathlib import Path
 from redbot.core import commands, Config
@@ -47,7 +48,6 @@ class AprilAI(commands.Cog):
             tts_enabled=True,
             text_response_when_voice=True,
             max_history=5,  # Default 5 exchanges
-            tts_server_url=""  # For HTTP server hosting TTS files
         )
 
     def cog_unload(self):
@@ -182,7 +182,7 @@ class AprilAI(commands.Cog):
                 await ctx.send(f"❌ Error: {e}")
 
     async def speak_response(self, ctx, text: str):
-        """Generate TTS and play through Lavalink"""
+        """Generate TTS and play through Lavalink - simplified version"""
         tts_key = await self.config.tts_key()
         if not tts_key:
             tllogger.warning("Skipping TTS: missing API key.")
@@ -195,48 +195,40 @@ class AprilAI(commands.Cog):
                 tllogger.warning("Skipping TTS: Player not connected.")
                 return
             
-            # Clean text for TTS (remove markdown formatting, etc.)
+            # Clean text for TTS
             clean_text = self.clean_text_for_tts(text)
             if not clean_text.strip():
                 return
             
-            # Split text into manageable chunks
-            chunks = self.split_text_for_tts(clean_text, max_length=1000)
+            # Generate TTS audio
+            audio_data = await self.generate_tts_audio(clean_text, tts_key)
+            if not audio_data:
+                tllogger.error("Failed to generate TTS audio")
+                return
             
-            for i, chunk in enumerate(chunks):
-                if not chunk.strip():
-                    continue
-                
-                # Generate TTS audio
-                audio_data = await self.generate_tts_audio(chunk, tts_key)
-                if not audio_data:
-                    continue
-                
-                # Create temporary file
-                temp_file = await self.create_temp_audio_file(audio_data)
-                if not temp_file:
-                    continue
-                
-                # Create a playable URI
-                track_uri = await self.create_playable_uri(temp_file, audio_data)
-                if not track_uri:
-                    continue
-                
-                # Get tracks from Lavalink
-                try:
-                    results = await lavalink.get_tracks(track_uri)
-                    if results and results.tracks:
-                        track = results.tracks[0]
-                        player.add(requester=ctx.author.id, track=track)
-                        tllogger.debug(f"Added TTS track {i+1}/{len(chunks)} to queue")
-                    else:
-                        tllogger.warning(f"No tracks found for URI: {track_uri}")
-                except Exception as e:
-                    tllogger.error(f"Failed to load track: {e}")
+            # Create data URI directly for Lavalink
+            encoded_data = base64.b64encode(audio_data).decode('utf-8')
+            data_uri = f"data:audio/mpeg;base64,{encoded_data}"
             
-            # Start playing if not already playing
-            if not player.is_playing and player.queue:
-                await player.play()
+            tllogger.debug(f"Created data URI with {len(audio_data)} bytes of audio data")
+            
+            # Get tracks from Lavalink
+            try:
+                results = await lavalink.get_tracks(data_uri)
+                if results and results.tracks:
+                    track = results.tracks[0]
+                    player.add(requester=ctx.author.id, track=track)
+                    tllogger.debug("Successfully added TTS track to queue")
+                    
+                    # Start playing if not already playing
+                    if not player.is_playing:
+                        await player.play()
+                        tllogger.debug("Started playing TTS")
+                else:
+                    tllogger.error(f"No tracks found for data URI (length: {len(data_uri)})")
+                    
+            except Exception as e:
+                tllogger.error(f"Failed to load track from data URI: {e}")
                 
         except Exception as e:
             tllogger.exception("TTS processing error")
@@ -254,32 +246,14 @@ class AprilAI(commands.Cog):
         # Remove URLs
         text = re.sub(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', '', text)
         
-        # Clean up extra whitespace
+        # Clean up extra whitespace and newlines
         text = re.sub(r'\s+', ' ', text).strip()
         
+        # Limit length to avoid API issues
+        if len(text) > 1000:
+            text = text[:1000].rsplit(' ', 1)[0] + "..."
+        
         return text
-
-    def split_text_for_tts(self, text: str, max_length: int = 1000) -> list:
-        """Split text into chunks suitable for TTS"""
-        if len(text) <= max_length:
-            return [text]
-        
-        chunks = []
-        sentences = text.split('. ')
-        current_chunk = ""
-        
-        for sentence in sentences:
-            if len(current_chunk + sentence + '. ') <= max_length:
-                current_chunk += sentence + '. '
-            else:
-                if current_chunk:
-                    chunks.append(current_chunk.strip())
-                current_chunk = sentence + '. '
-        
-        if current_chunk:
-            chunks.append(current_chunk.strip())
-        
-        return chunks
 
     async def generate_tts_audio(self, text: str, api_key: str) -> bytes:
         """Generate TTS audio using ElevenLabs API"""
@@ -300,9 +274,13 @@ class AprilAI(commands.Cog):
                 "Content-Type": "application/json"
             }
             
+            tllogger.debug(f"Requesting TTS for text: {text[:100]}...")
+            
             async with self.session.post(url, json=payload, headers=headers, timeout=30) as resp:
                 if resp.status == 200:
-                    return await resp.read()
+                    audio_data = await resp.read()
+                    tllogger.debug(f"Successfully generated {len(audio_data)} bytes of TTS audio")
+                    return audio_data
                 else:
                     error_text = await resp.text()
                     tllogger.error(f"TTS API error {resp.status}: {error_text}")
@@ -311,79 +289,6 @@ class AprilAI(commands.Cog):
         except Exception as e:
             tllogger.error(f"TTS generation failed: {e}")
             return None
-
-    async def create_temp_audio_file(self, audio_data: bytes) -> str:
-        """Create temporary audio file"""
-        try:
-            # Create unique filename
-            filename = f"tts_{int(time.time())}_{random.randint(0, 10000)}.mp3"
-            filepath = self.tts_dir / filename
-            
-            # Write audio data
-            with open(filepath, 'wb') as f:
-                f.write(audio_data)
-            
-            self.tts_files.add(str(filepath))
-            return str(filepath)
-            
-        except Exception as e:
-            tllogger.error(f"Failed to create temp audio file: {e}")
-            return None
-
-    async def create_playable_uri(self, filepath: str, audio_data: bytes) -> str:
-        """Create a URI that Lavalink can play"""
-        # Option 1: Try data URI (may not work with all Lavalink setups)
-        try:
-            import base64
-            encoded_data = base64.b64encode(audio_data).decode('utf-8')
-            data_uri = f"data:audio/mpeg;base64,{encoded_data}"
-            return data_uri
-        except:
-            pass
-        
-        # Option 2: If you have a web server configured, serve the file
-        server_url = await self.config.tts_server_url()
-        if server_url:
-            filename = os.path.basename(filepath)
-            return f"{server_url.rstrip('/')}/{filename}"
-        
-        # Option 3: Try file URI as fallback (unlikely to work)
-        return f"file://{filepath}"
-
-    @commands.Cog.listener()
-    async def on_red_audio_track_end(self, guild, track, reason):
-        """Clean up TTS files after playback"""
-        if self._unloading:
-            return
-        
-        # Clean up based on track info
-        if hasattr(track, 'uri') and track.uri:
-            # Handle data URIs or file URIs
-            if track.uri.startswith("file://"):
-                file_path = track.uri[7:]  # Remove file:// prefix
-                await self.cleanup_tts_file(file_path)
-            elif "tts_" in str(track.uri):
-                # Try to find matching file for cleanup
-                timestamp = int(time.time())
-                for filepath in list(self.tts_files):
-                    try:
-                        # Clean up files older than 5 minutes
-                        file_age = timestamp - os.path.getmtime(filepath)
-                        if file_age > 300:  # 5 minutes
-                            await self.cleanup_tts_file(filepath)
-                    except:
-                        pass
-
-    async def cleanup_tts_file(self, filepath: str):
-        """Clean up a single TTS file"""
-        if filepath in self.tts_files:
-            try:
-                if os.path.exists(filepath):
-                    os.unlink(filepath)
-                self.tts_files.discard(filepath)
-                tllogger.debug(f"Cleaned up TTS file: {filepath}")
-            except Exception as e:
-                tllogger.error(f"Error cleaning up TTS file {filepath}: {e}")
 
     @commands.group(name="aprilconfig", aliases=["aprilcfg"])
     @commands.is_owner()
@@ -411,16 +316,6 @@ class AprilAI(commands.Cog):
             await ctx.message.delete()
         except:
             pass
-
-    @aprilconfig.command()
-    async def ttsserver(self, ctx, url: str = None):
-        """Set TTS server URL for serving audio files to Lavalink"""
-        if url is None:
-            current = await self.config.tts_server_url()
-            await ctx.send(f"Current TTS server URL: `{current or 'Not set'}`")
-        else:
-            await self.config.tts_server_url.set(url)
-            await ctx.send(f"✅ TTS server URL set to `{url}`")
 
     @aprilconfig.command()
     async def voice(self, ctx, voice_id: str):
@@ -510,6 +405,21 @@ class AprilAI(commands.Cog):
         except ImportError:
             embed.add_field(name="Lavalink Module", value="❌ Not available", inline=True)
         
+        # Test TTS generation
+        tts_key = await self.config.tts_key()
+        if tts_key:
+            embed.add_field(name="ElevenLabs Key", value="✅ Set", inline=True)
+            try:
+                test_audio = await self.generate_tts_audio("Test", tts_key)
+                if test_audio:
+                    embed.add_field(name="TTS Generation", value=f"✅ Success ({len(test_audio)} bytes)", inline=True)
+                else:
+                    embed.add_field(name="TTS Generation", value="❌ Failed", inline=True)
+            except Exception as e:
+                embed.add_field(name="TTS Generation", value=f"❌ Error: {str(e)[:50]}", inline=True)
+        else:
+            embed.add_field(name="ElevenLabs Key", value="❌ Not set", inline=True)
+        
         await ctx.send(embed=embed)
 
     @aprilconfig.command(name="settings")
@@ -531,7 +441,6 @@ class AprilAI(commands.Cog):
         e.add_field(name="Max History", value=f"`{cfg['max_history']} exchanges`", inline=True)
         e.add_field(name="TTS Enabled", value="✅" if cfg['tts_enabled'] else "❌", inline=True)
         e.add_field(name="Text with Voice", value="✅" if cfg['text_response_when_voice'] else "❌", inline=True)
-        e.add_field(name="TTS Server URL", value=f"`{cfg['tts_server_url']}`" if cfg['tts_server_url'] else "❌ Not set", inline=False)
         
         prompt_preview = cfg['system_prompt'][:200] + ("..." if len(cfg['system_prompt']) > 200 else "")
         e.add_field(name="System Prompt", value=f"```{prompt_preview}```", inline=False)
