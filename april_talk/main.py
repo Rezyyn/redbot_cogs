@@ -245,53 +245,65 @@ class AprilAI(commands.Cog):
             
             tllogger.debug(f"Created data URI with {len(audio_data)} bytes of audio data")
             
-            # Try different methods to load tracks based on lavalink version
+            # Try to load tracks using the proper lavalink API
             try:
-                results = None
+                # First try: Use node's load_tracks method (proper way)
+                if hasattr(lavalink, 'node_manager') and lavalink.node_manager.nodes:
+                    node = list(lavalink.node_manager.nodes.values())[0]
+                    if hasattr(node, 'load_tracks'):
+                        result = await node.load_tracks(data_uri)
+                        if result and hasattr(result, 'tracks') and result.tracks:
+                            track = result.tracks[0]
+                            player.add(requester=ctx.author.id, track=track)
+                            tllogger.debug("Successfully added TTS track via node.load_tracks")
+                            
+                            if not player.is_playing:
+                                await player.play()
+                                tllogger.debug("Started playing TTS")
+                            return
                 
-                # Method 1: Try lavalink.get_tracks (newer versions)
-                if hasattr(lavalink, 'get_tracks'):
-                    results = await lavalink.get_tracks(data_uri)
-                
-                # Method 2: Try player.get_tracks (some versions)
-                elif hasattr(player, 'get_tracks'):
-                    results = await player.get_tracks(data_uri)
-                
-                # Method 3: Try lavalink.DefaultPlayer.get_tracks
-                elif hasattr(lavalink, 'DefaultPlayer') and hasattr(lavalink.DefaultPlayer, 'get_tracks'):
-                    results = await lavalink.DefaultPlayer.get_tracks(data_uri)
-                
-                # Method 4: Try the node directly
-                elif hasattr(lavalink, 'node_manager') and lavalink.node_manager.nodes:
+                # Second try: Use deprecated get_tracks if available
+                if hasattr(lavalink, 'node_manager') and lavalink.node_manager.nodes:
                     node = list(lavalink.node_manager.nodes.values())[0]
                     if hasattr(node, 'get_tracks'):
-                        results = await node.get_tracks(data_uri)
+                        tracks = await node.get_tracks(data_uri)
+                        if tracks:
+                            track = tracks[0]
+                            player.add(requester=ctx.author.id, track=track)
+                            tllogger.debug("Successfully added TTS track via node.get_tracks")
+                            
+                            if not player.is_playing:
+                                await player.play()
+                                tllogger.debug("Started playing TTS")
+                            return
                 
-                # Method 5: Try loading via player.load_tracks
-                elif hasattr(player, 'load_tracks'):
-                    results = await player.load_tracks(data_uri)
+                # Third try: Create RESTClient and use that
+                if hasattr(lavalink, 'RESTClient'):
+                    # Get the voice channel the bot is connected to
+                    channel_id = self.get_player_channel_id(player)
+                    if channel_id:
+                        voice_channel = self.bot.get_channel(channel_id)
+                        if voice_channel:
+                            rest_client = lavalink.RESTClient(self.bot, voice_channel)
+                            rest_client.state = lavalink.PlayerState.READY  # Set state to ready
+                            result = await rest_client.load_tracks(data_uri)
+                            if result and result.tracks:
+                                track = result.tracks[0]
+                                player.add(requester=ctx.author.id, track=track)
+                                tllogger.debug("Successfully added TTS track via RESTClient")
+                                
+                                if not player.is_playing:
+                                    await player.play()
+                                    tllogger.debug("Started playing TTS")
+                                return
                 
-                else:
-                    tllogger.error("Could not find a method to load tracks in this lavalink version")
-                    return
-                
-                if results and hasattr(results, 'tracks') and results.tracks:
-                    track = results.tracks[0]
-                    player.add(requester=ctx.author.id, track=track)
-                    tllogger.debug("Successfully added TTS track to queue")
-                    
-                    # Start playing if not already playing
-                    if not player.is_playing:
-                        await player.play()
-                        tllogger.debug("Started playing TTS")
-                elif results:
-                    tllogger.error(f"No tracks found in results: {type(results)}")
-                else:
-                    tllogger.error("No results returned from track loading")
+                tllogger.error("Could not find working method to load tracks")
+                # Try file fallback as last resort
+                await self.try_file_fallback(ctx, audio_data, player)
                     
             except Exception as e:
                 tllogger.error(f"Failed to load track from data URI: {e}")
-                # Fallback: Try writing to a temporary file instead
+                # Try file fallback
                 await self.try_file_fallback(ctx, audio_data, player)
                 
         except Exception as e:
@@ -309,30 +321,57 @@ class AprilAI(commands.Cog):
             self.tts_files.add(temp_path)
             tllogger.debug(f"Created temporary file: {temp_path}")
             
-            # Try to load the file
+            # Try to load the file using the proper lavalink API
             file_uri = f"file://{temp_path}"
             
-            # Try the same methods but with file URI
-            results = None
-            if hasattr(lavalink, 'get_tracks'):
-                results = await lavalink.get_tracks(file_uri)
-            elif hasattr(player, 'get_tracks'):
-                results = await player.get_tracks(file_uri)
-            elif hasattr(lavalink, 'node_manager') and lavalink.node_manager.nodes:
+            # Try node.load_tracks first
+            if hasattr(lavalink, 'node_manager') and lavalink.node_manager.nodes:
                 node = list(lavalink.node_manager.nodes.values())[0]
-                if hasattr(node, 'get_tracks'):
-                    results = await node.get_tracks(file_uri)
-            
-            if results and hasattr(results, 'tracks') and results.tracks:
-                track = results.tracks[0]
-                player.add(requester=ctx.author.id, track=track)
-                tllogger.debug("Successfully added TTS track from file fallback")
+                if hasattr(node, 'load_tracks'):
+                    result = await node.load_tracks(file_uri)
+                    if result and hasattr(result, 'tracks') and result.tracks:
+                        track = result.tracks[0]
+                        player.add(requester=ctx.author.id, track=track)
+                        tllogger.debug("Successfully added TTS track from file fallback via load_tracks")
+                        
+                        if not player.is_playing:
+                            await player.play()
+                            tllogger.debug("Started playing TTS from file")
+                        return
                 
-                if not player.is_playing:
-                    await player.play()
-                    tllogger.debug("Started playing TTS from file")
-            else:
-                tllogger.error("File fallback also failed")
+                # Try deprecated get_tracks
+                if hasattr(node, 'get_tracks'):
+                    tracks = await node.get_tracks(file_uri)
+                    if tracks:
+                        track = tracks[0]
+                        player.add(requester=ctx.author.id, track=track)
+                        tllogger.debug("Successfully added TTS track from file fallback via get_tracks")
+                        
+                        if not player.is_playing:
+                            await player.play()
+                            tllogger.debug("Started playing TTS from file")
+                        return
+            
+            # Try RESTClient approach
+            if hasattr(lavalink, 'RESTClient'):
+                channel_id = self.get_player_channel_id(player)
+                if channel_id:
+                    voice_channel = self.bot.get_channel(channel_id)
+                    if voice_channel:
+                        rest_client = lavalink.RESTClient(self.bot, voice_channel)
+                        rest_client.state = lavalink.PlayerState.READY
+                        result = await rest_client.load_tracks(file_uri)
+                        if result and result.tracks:
+                            track = result.tracks[0]
+                            player.add(requester=ctx.author.id, track=track)
+                            tllogger.debug("Successfully added TTS track from file via RESTClient")
+                            
+                            if not player.is_playing:
+                                await player.play()
+                                tllogger.debug("Started playing TTS from file")
+                            return
+            
+            tllogger.error("All file fallback methods failed")
                 
         except Exception as e:
             tllogger.error(f"File fallback failed: {e}")
