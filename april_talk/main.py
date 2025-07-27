@@ -71,6 +71,37 @@ class AprilAI(commands.Cog):
         """Get or create player for a guild using standard lavalink"""
         return lavalink.get_player(guild_id)
 
+    def is_player_connected(self, player):
+        """Check if player is connected using various possible attributes"""
+        # Try different possible attributes for connection status
+        if hasattr(player, 'is_connected'):
+            return player.is_connected
+        elif hasattr(player, 'channel_id'):
+            return bool(player.channel_id)
+        elif hasattr(player, 'connected'):
+            return player.connected
+        elif hasattr(player, 'channel'):
+            return bool(player.channel)
+        elif hasattr(player, '_channel_id'):
+            return bool(player._channel_id)
+        else:
+            # Fallback: try to access voice state
+            try:
+                return player.guild.voice_client is not None
+            except:
+                return False
+
+    def get_player_channel_id(self, player):
+        """Get the channel ID the player is connected to"""
+        if hasattr(player, 'channel_id'):
+            return player.channel_id
+        elif hasattr(player, '_channel_id'):
+            return player._channel_id
+        elif hasattr(player, 'channel'):
+            return player.channel.id if player.channel else None
+        else:
+            return None
+
     @commands.group(name="april", invoke_without_command=True)
     @commands.cooldown(1, 15, commands.BucketType.user)
     async def april(self, ctx, *, input: str):
@@ -109,15 +140,17 @@ class AprilAI(commands.Cog):
             # Get player using standard lavalink method
             player = self.get_player(ctx.guild.id)
             
-            # Connect to voice channel - check if connected using channel_id
-            if not player.channel_id:
+            # Connect to voice channel - check if connected
+            if not self.is_player_connected(player):
                 await player.connect(channel.id)
                 await ctx.send(f"🔊 Joined {channel.name}")
-            elif player.channel_id != channel.id:
-                await player.move_to(channel.id)
-                await ctx.send(f"🔊 Moved to {channel.name}")
             else:
-                await ctx.send("✅ Already in your voice channel")
+                current_channel_id = self.get_player_channel_id(player)
+                if current_channel_id != channel.id:
+                    await player.move_to(channel.id)
+                    await ctx.send(f"🔊 Moved to {channel.name}")
+                else:
+                    await ctx.send("✅ Already in your voice channel")
                 
         except Exception as e:
             tllogger.exception("[AprilAI] Failed join_voice")
@@ -127,7 +160,7 @@ class AprilAI(commands.Cog):
         """Leave voice channel"""
         try:
             player = self.get_player(ctx.guild.id)
-            if player.channel_id:  # Check if connected using channel_id
+            if self.is_player_connected(player):
                 await player.stop()
                 await player.disconnect()
                 await ctx.send("👋 Disconnected")
@@ -143,7 +176,7 @@ class AprilAI(commands.Cog):
         if await self.config.tts_enabled():
             try:
                 player = self.get_player(ctx.guild.id)
-                use_voice = bool(player.channel_id)  # Check if connected using channel_id
+                use_voice = self.is_player_connected(player)
             except:
                 use_voice = False
         
@@ -191,7 +224,7 @@ class AprilAI(commands.Cog):
         try:
             # Get player
             player = self.get_player(ctx.guild.id)
-            if not player.channel_id:  # Check if connected using channel_id
+            if not self.is_player_connected(player):
                 tllogger.warning("Skipping TTS: Player not connected.")
                 return
             
@@ -388,12 +421,20 @@ class AprilAI(commands.Cog):
             # Test getting a player
             player = self.get_player(ctx.guild.id)
             embed.add_field(name="Player Access", value="✅ Success", inline=True)
-            embed.add_field(name="Player Connected", value="✅ Yes" if player.channel_id else "❌ No", inline=True)
             
-            if player.channel_id:
-                channel = self.bot.get_channel(player.channel_id)
-                channel_name = channel.name if channel else "Unknown"
-                embed.add_field(name="Connected Channel", value=channel_name, inline=True)
+            is_connected = self.is_player_connected(player)
+            embed.add_field(name="Player Connected", value="✅ Yes" if is_connected else "❌ No", inline=True)
+            
+            if is_connected:
+                channel_id = self.get_player_channel_id(player)
+                if channel_id:
+                    channel = self.bot.get_channel(channel_id)
+                    channel_name = channel.name if channel else f"Unknown ({channel_id})"
+                    embed.add_field(name="Connected Channel", value=channel_name, inline=True)
+                
+            # Show available player attributes
+            player_attrs = [attr for attr in dir(player) if not attr.startswith('_')]
+            embed.add_field(name="Player Attributes", value=f"`{', '.join(player_attrs[:10])}...`", inline=False)
                 
         except Exception as e:
             embed.add_field(name="Player Access", value=f"❌ Error: {e}", inline=False)
@@ -497,14 +538,16 @@ class AprilAI(commands.Cog):
             
         try:
             player = self.get_player(member.guild.id)
-            if player.channel_id:  # Check if connected using channel_id
+            if self.is_player_connected(player):
                 # Check if only bot remains in voice
-                voice_channel = self.bot.get_channel(player.channel_id)
-                if voice_channel:
-                    human_members = [m for m in voice_channel.members if not m.bot]
-                    if len(human_members) == 0:
-                        await player.disconnect()
-                        tllogger.debug(f"Left voice in {member.guild} (empty channel)")
+                channel_id = self.get_player_channel_id(player)
+                if channel_id:
+                    voice_channel = self.bot.get_channel(channel_id)
+                    if voice_channel:
+                        human_members = [m for m in voice_channel.members if not m.bot]
+                        if len(human_members) == 0:
+                            await player.disconnect()
+                            tllogger.debug(f"Left voice in {member.guild} (empty channel)")
         except Exception as e:
             tllogger.error(f"Error handling voice state update: {e}")
 
