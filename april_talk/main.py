@@ -8,6 +8,7 @@ import random
 import time
 import tempfile
 import base64
+import re
 from collections import deque
 from pathlib import Path
 from redbot.core import commands, Config
@@ -15,10 +16,40 @@ from redbot.core.bot import Red
 from redbot.core.data_manager import cog_data_path
 from redbot.core.utils.chat_formatting import pagify
 from redbot.core.utils.menus import menu, DEFAULT_CONTROLS
+from typing import Optional, List, Dict
 
 # Logger
 tllogger = logging.getLogger("red.aprilai")
 tllogger.setLevel(logging.DEBUG)
+
+# Emotion GIFs repository
+EMOTION_GIFS = {
+    "happy": [
+        "https://media.giphy.com/media/XbxZ41fWLeRECPsGIJ/giphy.gif",
+        "https://media.giphy.com/media/l0HlMG1EX2H38cZeE/giphy.gif",
+        "https://media.giphy.com/media/3o7abKhOpu0NwenH3O/giphy.gif"
+    ],
+    "thinking": [
+        "https://media.giphy.com/media/d3mlE7uhX8KFgEmY/giphy.gif",
+        "https://media.giphy.com/media/3o7btPCcdNniyf0ArS/giphy.gif",
+        "https://media.giphy.com/media/l0HlUNj5BRuYDLxFm/giphy.gif"
+    ],
+    "confused": [
+        "https://media.giphy.com/media/3o7btPCcdNniyf0ArS/giphy.gif",
+        "https://media.giphy.com/media/xT0xeJpnrWC4XWblEk/giphy.gif",
+        "https://media.giphy.com/media/3oEjI5VtIhHvK37WYo/giphy.gif"
+    ],
+    "excited": [
+        "https://media.giphy.com/media/5GoVLqeAOo6PK/giphy.gif",
+        "https://media.giphy.com/media/l0HlMURBbyUqF0XQI/giphy.gif",
+        "https://media.giphy.com/media/3rgXBOmTlzyFCURutG/giphy.gif"
+    ],
+    "sad": [
+        "https://media.giphy.com/media/OPU6wzx8JrHna/giphy.gif",
+        "https://media.giphy.com/media/l1AsyjZ8XLd1V7pUk/giphy.gif",
+        "https://media.giphy.com/media/3o7TKSjRrfIPjeiVyM/giphy.gif"
+    ]
+}
 
 class AprilAI(commands.Cog):
     """AI assistant with text and voice via Lavalink"""
@@ -32,6 +63,8 @@ class AprilAI(commands.Cog):
         # Track TTS files for cleanup
         self.tts_files = set()
         self._unloading = False
+        # Streaming message cache
+        self.streaming_messages = {}
         
         # Create TTS directory using cog-specific path
         self.tts_dir = Path(cog_data_path(self)) / "tts"
@@ -39,15 +72,25 @@ class AprilAI(commands.Cog):
         
         self.config.register_global(
             deepseek_key="",
+            anthropic_key="",  # For smert mode
             tts_key="",
             voice_id="21m00Tcm4TlvDq8ikWAM",
             model="deepseek-chat",
             temperature=0.7,
             max_tokens=2048,
             system_prompt="You are April, a helpful AI assistant.",
+            smert_prompt="You are April in 'smert' mode - an incredibly intelligent, witty, and creative AI assistant with deep knowledge across all domains.",
             tts_enabled=True,
             text_response_when_voice=True,
             max_history=5,  # Default 5 exchanges
+            use_gifs=True,
+            max_message_length=1800,  # For splitting long messages
+        )
+        
+        self.config.register_user(
+            smert_mode=False,
+            custom_anthropic_key="",
+            custom_smert_prompt=""
         )
 
     def cog_unload(self):
@@ -66,6 +109,24 @@ class AprilAI(commands.Cog):
                 tllogger.error(f"Error cleaning up TTS file {path}: {e}")
             finally:
                 self.tts_files.discard(path)
+
+    async def detect_emotion(self, text: str) -> Optional[str]:
+        """Detect emotion from text for GIF selection"""
+        text_lower = text.lower()
+        
+        # Simple keyword-based emotion detection
+        if any(word in text_lower for word in ["happy", "great", "awesome", "excellent", "wonderful", "amazing"]):
+            return "happy"
+        elif any(word in text_lower for word in ["think", "consider", "ponder", "wonder", "hmm"]):
+            return "thinking"
+        elif any(word in text_lower for word in ["confused", "don't understand", "what", "huh", "unclear"]):
+            return "confused"
+        elif any(word in text_lower for word in ["excited", "can't wait", "awesome!", "wow", "amazing!"]):
+            return "excited"
+        elif any(word in text_lower for word in ["sad", "sorry", "unfortunately", "regret"]):
+            return "sad"
+        
+        return None
 
     def get_player(self, guild_id: int):
         """Get or create player for a guild using standard lavalink"""
@@ -105,15 +166,45 @@ class AprilAI(commands.Cog):
     @commands.group(name="april", invoke_without_command=True)
     @commands.cooldown(1, 15, commands.BucketType.user)
     async def april(self, ctx, *, input: str):
+        """Main April command"""
         cmd = input.strip().lower()
+        
+        # Handle special commands
         if cmd == "join":
             return await self.join_voice(ctx)
         if cmd == "leave":
             return await self.leave_voice(ctx)
         if cmd == "clearhistory":
             return await self.clear_history(ctx)
+        if cmd == "smert":
+            return await self.toggle_smert_mode(ctx)
+            
         tllogger.debug(f"Command april: {input} by {ctx.author}")
         await self.process_query(ctx, input)
+
+    @april.command(name="smert")
+    async def toggle_smert_mode(self, ctx):
+        """Toggle smert mode (requires Anthropic API key)"""
+        user_config = self.config.user(ctx.author)
+        current_mode = await user_config.smert_mode()
+        
+        if not current_mode:
+            # Check if user has custom key or global key exists
+            custom_key = await user_config.custom_anthropic_key()
+            global_key = await self.config.anthropic_key()
+            
+            if not custom_key and not global_key:
+                return await ctx.send(
+                    "❌ Smert mode requires an Anthropic API key. "
+                    "Set one with `[p]aprilconfig anthropickey <key>` or "
+                    "`[p]apriluser setkey <key>`"
+                )
+            
+            await user_config.smert_mode.set(True)
+            await ctx.send("🧠 Smert mode activated! I'm now using Claude for enhanced intelligence.")
+        else:
+            await user_config.smert_mode.set(False)
+            await ctx.send("💡 Smert mode deactivated. Back to regular mode.")
 
     @april.command(name="clearhistory")
     async def clear_history(self, ctx):
@@ -123,6 +214,7 @@ class AprilAI(commands.Cog):
             self.history[channel_id].clear()
         await ctx.send("✅ Conversation history cleared for this channel.")
 
+    @april.command(name="join")
     async def join_voice(self, ctx):
         """Join voice channel"""
         tllogger.info(f"[AprilAI] join_voice invoked by {ctx.author}")
@@ -137,25 +229,19 @@ class AprilAI(commands.Cog):
             return await ctx.send("❌ I need permissions to connect and speak!")
         
         try:
-            # Get player using standard lavalink method
-            player = self.get_player(ctx.guild.id)
+            # First, check if lavalink is initialized
+            if not hasattr(lavalink, '_lavalink'):
+                return await ctx.send("❌ Lavalink is not initialized. Make sure Audio cog is loaded.")
             
-            # Connect to voice channel - check if connected
-            if not self.is_player_connected(player):
-                await player.connect(channel.id)
-                await ctx.send(f"🔊 Joined {channel.name}")
-            else:
-                current_channel_id = self.get_player_channel_id(player)
-                if current_channel_id != channel.id:
-                    await player.move_to(channel.id)
-                    await ctx.send(f"🔊 Moved to {channel.name}")
-                else:
-                    await ctx.send("✅ Already in your voice channel")
+            # Connect using lavalink.connect directly
+            player = await lavalink.connect(channel, self_deaf=True)
+            await ctx.send(f"🔊 Joined {channel.name}")
                 
         except Exception as e:
             tllogger.exception("[AprilAI] Failed join_voice")
             await ctx.send(f"❌ Join failed: {e}")
 
+    @april.command(name="leave")
     async def leave_voice(self, ctx):
         """Leave voice channel"""
         try:
@@ -180,7 +266,13 @@ class AprilAI(commands.Cog):
             except:
                 use_voice = False
         
-        tllogger.debug(f"process_query use_voice={use_voice}")
+        # Check if user is in smert mode
+        user_config = self.config.user(ctx.author)
+        smert_mode = await user_config.smert_mode()
+        
+        tllogger.debug(f"process_query use_voice={use_voice}, smert_mode={smert_mode}")
+        
+        # Start typing indicator
         async with ctx.typing():
             try:
                 # Get or create history for this channel
@@ -190,21 +282,29 @@ class AprilAI(commands.Cog):
                     self.history[channel_id] = deque(maxlen=max_history * 2)  # 2 messages per exchange
                 
                 # Build message history
-                messages = [
-                    {"role": "system", "content": await self.config.system_prompt()}
-                ]
+                if smert_mode:
+                    custom_prompt = await user_config.custom_smert_prompt()
+                    system_prompt = custom_prompt or await self.config.smert_prompt()
+                else:
+                    system_prompt = await self.config.system_prompt()
+                    
+                messages = [{"role": "system", "content": system_prompt}]
                 messages.extend(self.history[channel_id])
                 messages.append({"role": "user", "content": input_text})
                 
-                resp = await self.query_deepseek(ctx.author.id, messages)
+                # Get response from appropriate API
+                if smert_mode:
+                    resp = await self.query_anthropic(ctx.author.id, messages)
+                else:
+                    resp = await self.query_deepseek(ctx.author.id, messages)
                 
                 # Update history with new exchange
                 self.history[channel_id].append({"role": "user", "content": input_text})
                 self.history[channel_id].append({"role": "assistant", "content": resp})
                 
-                # Send text response unless disabled when using voice
+                # Send response
                 if not (use_voice and not await self.config.text_response_when_voice()):
-                    await self.send_text_response(ctx, resp)
+                    await self.send_streamed_response(ctx, resp)
                 
                 # Send voice response if enabled and connected
                 if use_voice:
@@ -214,8 +314,84 @@ class AprilAI(commands.Cog):
                 tllogger.exception("process_query error")
                 await ctx.send(f"❌ Error: {e}")
 
+    async def send_streamed_response(self, ctx, resp: str):
+        """Send response with streaming effect and handle long messages"""
+        max_length = await self.config.max_message_length()
+        use_gifs = await self.config.use_gifs()
+        
+        # Detect emotion and potentially add GIF
+        emotion = await self.detect_emotion(resp) if use_gifs else None
+        gif_url = None
+        if emotion and random.random() < 0.3:  # 30% chance to include GIF
+            gif_url = random.choice(EMOTION_GIFS[emotion])
+        
+        # Split long messages
+        if len(resp) > max_length:
+            # Create initial "thinking" message
+            embed = discord.Embed(
+                description="💭 *Thinking...*",
+                color=await ctx.embed_color()
+            )
+            thinking_msg = await ctx.send(embed=embed)
+            
+            # Split response into chunks
+            chunks = []
+            words = resp.split(' ')
+            current_chunk = []
+            current_length = 0
+            
+            for word in words:
+                if current_length + len(word) + 1 > max_length:
+                    chunks.append(' '.join(current_chunk))
+                    current_chunk = [word]
+                    current_length = len(word)
+                else:
+                    current_chunk.append(word)
+                    current_length += len(word) + 1
+            
+            if current_chunk:
+                chunks.append(' '.join(current_chunk))
+            
+            # Send first chunk by editing thinking message
+            first_chunk = chunks[0]
+            if gif_url and len(chunks) == 1:
+                await thinking_msg.edit(content=first_chunk + f"\n{gif_url}", embed=None)
+            else:
+                await thinking_msg.edit(content=first_chunk, embed=None)
+            
+            # Send remaining chunks
+            for i, chunk in enumerate(chunks[1:], 1):
+                await asyncio.sleep(0.5)  # Small delay between messages
+                if gif_url and i == len(chunks) - 1:
+                    await ctx.send(chunk + f"\n{gif_url}")
+                else:
+                    await ctx.send(chunk)
+        else:
+            # Single message with streaming effect
+            embed = discord.Embed(
+                description="💭 *Thinking...*",
+                color=await ctx.embed_color()
+            )
+            msg = await ctx.send(embed=embed)
+            
+            # Simulate streaming by updating message in chunks
+            chunk_size = 50
+            for i in range(0, len(resp), chunk_size):
+                chunk = resp[:i + chunk_size]
+                if i + chunk_size >= len(resp) and gif_url:
+                    await msg.edit(content=chunk + f"\n{gif_url}", embed=None)
+                else:
+                    await msg.edit(content=chunk + "▌", embed=None)
+                await asyncio.sleep(0.05)  # Small delay for streaming effect
+            
+            # Final message without cursor
+            if gif_url:
+                await msg.edit(content=resp + f"\n{gif_url}", embed=None)
+            else:
+                await msg.edit(content=resp, embed=None)
+
     async def speak_response(self, ctx, text: str):
-        """Generate TTS and play through Lavalink - simplified version"""
+        """Generate TTS and play through Lavalink"""
         tts_key = await self.config.tts_key()
         if not tts_key:
             tllogger.warning("Skipping TTS: missing API key.")
@@ -239,147 +415,62 @@ class AprilAI(commands.Cog):
                 tllogger.error("Failed to generate TTS audio")
                 return
             
-            # Create data URI directly for Lavalink
-            encoded_data = base64.b64encode(audio_data).decode('utf-8')
-            data_uri = f"data:audio/mpeg;base64,{encoded_data}"
+            # Save to temporary file (Lavalink needs file:// URLs for local files)
+            import uuid
+            temp_filename = f"tts_{uuid.uuid4().hex}.mp3"
+            temp_path = self.tts_dir / temp_filename
             
-            tllogger.debug(f"Created data URI with {len(audio_data)} bytes of audio data")
+            with open(temp_path, 'wb') as f:
+                f.write(audio_data)
             
-            # Try to load tracks using the proper lavalink API
-            try:
-                # First try: Use node's load_tracks method (proper way)
-                if hasattr(lavalink, 'node_manager') and lavalink.node_manager.nodes:
-                    node = list(lavalink.node_manager.nodes.values())[0]
-                    if hasattr(node, 'load_tracks'):
-                        result = await node.load_tracks(data_uri)
-                        if result and hasattr(result, 'tracks') and result.tracks:
-                            track = result.tracks[0]
-                            player.add(requester=ctx.author.id, track=track)
-                            tllogger.debug("Successfully added TTS track via node.load_tracks")
-                            
-                            if not player.is_playing:
-                                await player.play()
-                                tllogger.debug("Started playing TTS")
-                            return
+            self.tts_files.add(str(temp_path))
+            tllogger.debug(f"Created TTS file: {temp_path}")
+            
+            # Create file URL
+            file_url = f"file://{temp_path}"
+            
+            # Load and play the track
+            tracks = await player.search_yt(file_url)  # This will use the file:// URL
+            if not tracks:
+                # Try direct load
+                tracks = await player.node.load_tracks(file_url)
                 
-                # Second try: Use deprecated get_tracks if available
-                if hasattr(lavalink, 'node_manager') and lavalink.node_manager.nodes:
-                    node = list(lavalink.node_manager.nodes.values())[0]
-                    if hasattr(node, 'get_tracks'):
-                        tracks = await node.get_tracks(data_uri)
-                        if tracks:
-                            track = tracks[0]
-                            player.add(requester=ctx.author.id, track=track)
-                            tllogger.debug("Successfully added TTS track via node.get_tracks")
-                            
-                            if not player.is_playing:
-                                await player.play()
-                                tllogger.debug("Started playing TTS")
-                            return
+            if tracks:
+                track = tracks[0] if hasattr(tracks, '__getitem__') else tracks.tracks[0]
+                player.add(requester=ctx.author.id, track=track)
                 
-                # Third try: Create RESTClient and use that
-                if hasattr(lavalink, 'RESTClient'):
-                    # Get the voice channel the bot is connected to
-                    channel_id = self.get_player_channel_id(player)
-                    if channel_id:
-                        voice_channel = self.bot.get_channel(channel_id)
-                        if voice_channel:
-                            rest_client = lavalink.RESTClient(self.bot, voice_channel)
-                            rest_client.state = lavalink.PlayerState.READY  # Set state to ready
-                            result = await rest_client.load_tracks(data_uri)
-                            if result and result.tracks:
-                                track = result.tracks[0]
-                                player.add(requester=ctx.author.id, track=track)
-                                tllogger.debug("Successfully added TTS track via RESTClient")
-                                
-                                if not player.is_playing:
-                                    await player.play()
-                                    tllogger.debug("Started playing TTS")
-                                return
-                
-                tllogger.error("Could not find working method to load tracks")
-                # Try file fallback as last resort
-                await self.try_file_fallback(ctx, audio_data, player)
+                if not player.is_playing:
+                    await player.play()
                     
-            except Exception as e:
-                tllogger.error(f"Failed to load track from data URI: {e}")
-                # Try file fallback
-                await self.try_file_fallback(ctx, audio_data, player)
+                tllogger.debug("Successfully started TTS playback")
+                
+                # Clean up file after a delay
+                asyncio.create_task(self._cleanup_tts_file(str(temp_path), delay=30))
+            else:
+                tllogger.error("Failed to load TTS track")
+                # Clean up immediately on failure
+                self._cleanup_tts_file_sync(str(temp_path))
                 
         except Exception as e:
             tllogger.exception("TTS processing error")
 
-    async def try_file_fallback(self, ctx, audio_data: bytes, player):
-        """Fallback method: save to temp file and try loading that"""
+    async def _cleanup_tts_file(self, path: str, delay: int = 30):
+        """Clean up TTS file after delay"""
+        await asyncio.sleep(delay)
+        self._cleanup_tts_file_sync(path)
+
+    def _cleanup_tts_file_sync(self, path: str):
+        """Synchronously clean up TTS file"""
         try:
-            # Create temporary file
-            import tempfile
-            with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as tmp_file:
-                tmp_file.write(audio_data)
-                temp_path = tmp_file.name
-            
-            self.tts_files.add(temp_path)
-            tllogger.debug(f"Created temporary file: {temp_path}")
-            
-            # Try to load the file using the proper lavalink API
-            file_uri = f"file://{temp_path}"
-            
-            # Try node.load_tracks first
-            if hasattr(lavalink, 'node_manager') and lavalink.node_manager.nodes:
-                node = list(lavalink.node_manager.nodes.values())[0]
-                if hasattr(node, 'load_tracks'):
-                    result = await node.load_tracks(file_uri)
-                    if result and hasattr(result, 'tracks') and result.tracks:
-                        track = result.tracks[0]
-                        player.add(requester=ctx.author.id, track=track)
-                        tllogger.debug("Successfully added TTS track from file fallback via load_tracks")
-                        
-                        if not player.is_playing:
-                            await player.play()
-                            tllogger.debug("Started playing TTS from file")
-                        return
-                
-                # Try deprecated get_tracks
-                if hasattr(node, 'get_tracks'):
-                    tracks = await node.get_tracks(file_uri)
-                    if tracks:
-                        track = tracks[0]
-                        player.add(requester=ctx.author.id, track=track)
-                        tllogger.debug("Successfully added TTS track from file fallback via get_tracks")
-                        
-                        if not player.is_playing:
-                            await player.play()
-                            tllogger.debug("Started playing TTS from file")
-                        return
-            
-            # Try RESTClient approach
-            if hasattr(lavalink, 'RESTClient'):
-                channel_id = self.get_player_channel_id(player)
-                if channel_id:
-                    voice_channel = self.bot.get_channel(channel_id)
-                    if voice_channel:
-                        rest_client = lavalink.RESTClient(self.bot, voice_channel)
-                        rest_client.state = lavalink.PlayerState.READY
-                        result = await rest_client.load_tracks(file_uri)
-                        if result and result.tracks:
-                            track = result.tracks[0]
-                            player.add(requester=ctx.author.id, track=track)
-                            tllogger.debug("Successfully added TTS track from file via RESTClient")
-                            
-                            if not player.is_playing:
-                                await player.play()
-                                tllogger.debug("Started playing TTS from file")
-                            return
-            
-            tllogger.error("All file fallback methods failed")
-                
+            if os.path.exists(path):
+                os.unlink(path)
+            self.tts_files.discard(path)
+            tllogger.debug(f"Cleaned up TTS file: {path}")
         except Exception as e:
-            tllogger.error(f"File fallback failed: {e}")
+            tllogger.error(f"Error cleaning up TTS file {path}: {e}")
 
     def clean_text_for_tts(self, text: str) -> str:
         """Clean text for better TTS output"""
-        import re
-        
         # Remove markdown formatting
         text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)  # **bold**
         text = re.sub(r'\*(.*?)\*', r'\1', text)      # *italic*
@@ -451,6 +542,16 @@ class AprilAI(commands.Cog):
             pass
 
     @aprilconfig.command()
+    async def anthropickey(self, ctx, key: str):
+        """Set Anthropic API key for smert mode"""
+        await self.config.anthropic_key.set(key)
+        await ctx.tick()
+        try:
+            await ctx.message.delete()
+        except:
+            pass
+
+    @aprilconfig.command()
     async def elevenlabs(self, ctx, key: str):
         """Set ElevenLabs API key"""
         await self.config.tts_key.set(key)
@@ -477,6 +578,12 @@ class AprilAI(commands.Cog):
         """Set system prompt for the AI"""
         await self.config.system_prompt.set(system_prompt)
         await ctx.send("✅ System prompt updated")
+
+    @aprilconfig.command()
+    async def smertprompt(self, ctx, *, prompt: str):
+        """Set default smert mode prompt"""
+        await self.config.smert_prompt.set(prompt)
+        await ctx.send("✅ Smert mode prompt updated")
 
     @aprilconfig.command()
     async def temperature(self, ctx, value: float):
@@ -522,145 +629,45 @@ class AprilAI(commands.Cog):
         else:
             await ctx.send("❌ Value must be between 1 and 20")
 
+    @aprilconfig.command()
+    async def gifs(self, ctx, enabled: bool):
+        """Enable/disable emotion GIFs"""
+        await self.config.use_gifs.set(enabled)
+        status = "enabled" if enabled else "disabled"
+        await ctx.send(f"✅ Emotion GIFs {status}")
+
+    @aprilconfig.command()
+    async def messagelength(self, ctx, length: int):
+        """Set max message length before splitting (500-2000)"""
+        if 500 <= length <= 2000:
+            await self.config.max_message_length.set(length)
+            await ctx.send(f"✅ Max message length set to `{length}`")
+        else:
+            await ctx.send("❌ Value must be between 500 and 2000")
+
     @aprilconfig.command(name="debug")
     async def debug_lavalink(self, ctx):
         """Debug Lavalink connection status"""
         embed = discord.Embed(title="AprilAI Debug Information", color=0xff0000)
         
         try:
-            # Test getting a player
-            player = self.get_player(ctx.guild.id)
-            embed.add_field(name="Player Access", value="✅ Success", inline=True)
-            
-            is_connected = self.is_player_connected(player)
-            embed.add_field(name="Player Connected", value="✅ Yes" if is_connected else "❌ No", inline=True)
-            
-            if is_connected:
-                channel_id = self.get_player_channel_id(player)
-                if channel_id:
-                    channel = self.bot.get_channel(channel_id)
-                    channel_name = channel.name if channel else f"Unknown ({channel_id})"
-                    embed.add_field(name="Connected Channel", value=channel_name, inline=True)
+            # Check lavalink initialization
+            if hasattr(lavalink, '_lavalink'):
+                embed.add_field(name="Lavalink Status", value="✅ Initialized", inline=True)
                 
-            # Show available player attributes
-            player_attrs = [attr for attr in dir(player) if not attr.startswith('_')]
-            embed.add_field(name="Player Attributes", value=f"`{', '.join(player_attrs[:10])}...`", inline=False)
+                # Test getting a player
+                player = self.get_player(ctx.guild.id)
+                embed.add_field(name="Player Access", value="✅ Success", inline=True)
                 
-        except Exception as e:
-            embed.add_field(name="Player Access", value=f"❌ Error: {e}", inline=False)
-        
-        # Check if lavalink module is available
-        try:
-            import lavalink
-            embed.add_field(name="Lavalink Module", value="✅ Available", inline=True)
-        except ImportError:
-            embed.add_field(name="Lavalink Module", value="❌ Not available", inline=True)
-        
-        # Test TTS generation
-        tts_key = await self.config.tts_key()
-        if tts_key:
-            embed.add_field(name="ElevenLabs Key", value="✅ Set", inline=True)
-            try:
-                test_audio = await self.generate_tts_audio("Test", tts_key)
-                if test_audio:
-                    embed.add_field(name="TTS Generation", value=f"✅ Success ({len(test_audio)} bytes)", inline=True)
-                else:
-                    embed.add_field(name="TTS Generation", value="❌ Failed", inline=True)
-            except Exception as e:
-                embed.add_field(name="TTS Generation", value=f"❌ Error: {str(e)[:50]}", inline=True)
-        else:
-            embed.add_field(name="ElevenLabs Key", value="❌ Not set", inline=True)
-        
-        await ctx.send(embed=embed)
-
-    @aprilconfig.command(name="settings")
-    async def show_settings(self, ctx):
-        """Show current configuration"""
-        cfg = await self.config.all()
-        e = discord.Embed(title="AprilAI Configuration", color=await ctx.embed_color())
-        
-        # Security: show partial keys
-        deepseek_key = cfg['deepseek_key']
-        tts_key = cfg['tts_key']
-        
-        e.add_field(name="DeepSeek Key", value=f"`...{deepseek_key[-4:]}`" if deepseek_key else "❌ Not set", inline=False)
-        e.add_field(name="ElevenLabs Key", value=f"`...{tts_key[-4:]}`" if tts_key else "❌ Not set", inline=False)
-        e.add_field(name="Voice ID", value=f"`{cfg['voice_id']}`", inline=True)
-        e.add_field(name="Model", value=f"`{cfg['model']}`", inline=True)
-        e.add_field(name="Temperature", value=f"`{cfg['temperature']}`", inline=True)
-        e.add_field(name="Max Tokens", value=f"`{cfg['max_tokens']}`", inline=True)
-        e.add_field(name="Max History", value=f"`{cfg['max_history']} exchanges`", inline=True)
-        e.add_field(name="TTS Enabled", value="✅" if cfg['tts_enabled'] else "❌", inline=True)
-        e.add_field(name="Text with Voice", value="✅" if cfg['text_response_when_voice'] else "❌", inline=True)
-        
-        prompt_preview = cfg['system_prompt'][:200] + ("..." if len(cfg['system_prompt']) > 200 else "")
-        e.add_field(name="System Prompt", value=f"```{prompt_preview}```", inline=False)
-        
-        await ctx.send(embed=e)
-
-    async def query_deepseek(self, user_id: int, messages: list):
-        """Query DeepSeek API"""
-        key = await self.config.deepseek_key()
-        if not key: 
-            raise Exception("DeepSeek API key not set. Use `[p]aprilconfig deepseekkey <key>`")
-            
-        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-        payload = {
-            "model": await self.config.model(),
-            "messages": messages,
-            "temperature": await self.config.temperature(),
-            "max_tokens": await self.config.max_tokens(),
-            "user": str(user_id)
-        }
-        
-        try:
-            async with self.session.post(
-                "https://api.deepseek.com/v1/chat/completions", 
-                json=payload,
-                headers=headers, 
-                timeout=30
-            ) as r:
-                if r.status != 200:
-                    error_data = await r.json()
-                    err_msg = error_data.get("error", {}).get("message", f"HTTP Error {r.status}")
-                    raise Exception(f"API Error: {err_msg}")
+                is_connected = self.is_player_connected(player)
+                embed.add_field(name="Player Connected", value="✅ Yes" if is_connected else "❌ No", inline=True)
                 
-                data = await r.json()
-                return data["choices"][0]["message"]["content"].strip()
-        except asyncio.TimeoutError:
-            raise Exception("API request timed out")
-        except Exception as e:
-            raise Exception(f"API Error: {str(e)}")
-
-    async def send_text_response(self, ctx, resp: str):
-        """Send text response, paginated if necessary"""
-        if len(resp) > 1900:
-            pages = list(pagify(resp, delims=["\n", " "], page_length=1500))
-            await menu(ctx, pages, DEFAULT_CONTROLS)
-        else:
-            await ctx.send(resp)
-
-    @commands.Cog.listener()
-    async def on_voice_state_update(self, member, before, after):
-        """Handle voice state updates"""
-        if member.bot:
-            return
-            
-        try:
-            player = self.get_player(member.guild.id)
-            if self.is_player_connected(player):
-                # Check if only bot remains in voice
-                channel_id = self.get_player_channel_id(player)
-                if channel_id:
-                    voice_channel = self.bot.get_channel(channel_id)
-                    if voice_channel:
-                        human_members = [m for m in voice_channel.members if not m.bot]
-                        if len(human_members) == 0:
-                            await player.disconnect()
-                            tllogger.debug(f"Left voice in {member.guild} (empty channel)")
-        except Exception as e:
-            tllogger.error(f"Error handling voice state update: {e}")
-
-async def setup(bot):
-    """Set up the cog"""
-    await bot.add_cog(AprilAI(bot))
+                if is_connected:
+                    channel_id = self.get_player_channel_id(player)
+                    if channel_id:
+                        channel = self.bot.get_channel(channel_id)
+                        channel_name = channel.name if channel else f"Unknown ({channel_id})"
+                        embed.add_field(name="Connected Channel", value=channel_name, inline=True)
+            else:
+                embed.add_field(name="Lavalink Status", value="❌ Not initialized", inline=True)
+                embed.add_field(name="Solution", value="Load the Audio cog first", inline=False)
