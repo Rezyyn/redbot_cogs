@@ -427,7 +427,8 @@ class AprilAI(commands.Cog):
             tllogger.debug(f"TTS audio saved: {filepath.name}")
 
             # Play using Red's local playlist
-            await ctx.invoke(ctx.bot.get_command("local start"), "tts_april")
+            await ctx.invoke(ctx.bot.get_command("local start"), folder_name="tts_april")
+
 
             # Delay then delete file
             async def delayed_delete():
