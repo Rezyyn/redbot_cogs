@@ -390,52 +390,59 @@ class AprilAI(commands.Cog):
             else:
                 await msg.edit(content=resp, embed=None)
 
-   async def speak_response(self, ctx, text: str):
-        """Generate TTS and play through Red's local playlist system"""
+    async def speak_response(self, ctx, text: str):
+        """Generate TTS, play via local command, and clean up"""
         tts_key = await self.config.tts_key()
         if not tts_key:
             tllogger.warning("Skipping TTS: missing API key.")
             return
 
         try:
-            # Get player and check voice connection
+            # Verify voice connection
             player = self.get_player(ctx.guild.id)
             if not self.is_player_connected(player):
                 tllogger.warning("Skipping TTS: Player not connected.")
                 return
 
-            # Clean text
+            # Clean and generate TTS
             clean_text = self.clean_text_for_tts(text)
             if not clean_text.strip():
                 return
 
-            # Generate audio
             audio_data = await self.generate_tts_audio(clean_text, tts_key)
             if not audio_data:
                 tllogger.error("Failed to generate TTS audio")
                 return
 
-            # Save audio to localtracks folder
-            tts_path = cog_data_path(self) / "tts_april"
+            # Prepare path in Red's required localtracks folder
             localtrack_dir = cog_data_path(self).parent / "Audio" / "localtracks" / "tts_april"
             localtrack_dir.mkdir(parents=True, exist_ok=True)
 
-            filename = f"tts_{int(time.time())}_{random.randint(1000,9999)}.mp3"
+            filename = f"tts_{int(time.time())}_{random.randint(1000, 9999)}.mp3"
             filepath = localtrack_dir / filename
 
             with open(filepath, 'wb') as f:
                 f.write(audio_data)
 
-            tllogger.debug(f"TTS audio saved: {filepath}")
+            tllogger.debug(f"TTS audio saved: {filepath.name}")
 
-            # Start playback via Redbot's local command
+            # Play using Red's local playlist
             await ctx.invoke(ctx.bot.get_command("local start"), "tts_april")
 
-            # Optionally clean up after delay (to prevent piling up)
-            asyncio.create_task(self._cleanup_tts_file(str(filepath), delay=60))
+            # Delay then delete file
+            async def delayed_delete():
+                await asyncio.sleep(1800)
+                try:
+                    filepath.unlink()
+                    tllogger.debug(f"TTS file deleted: {filepath.name}")
+                except Exception as e:
+                    tllogger.error(f"Failed to delete TTS file: {filepath.name} — {e}")
+
+            asyncio.create_task(delayed_delete())
 
         except Exception as e:
             tllogger.exception("TTS playback failed")
+
 
     async def _cleanup_tts_file(self, path: str, delay: int = 30):
         """Clean up TTS file after delay"""
