@@ -1,36 +1,3 @@
-import asyncio
-import aiohttp
-import discord
-import lavalink
-import os
-import logging
-import random
-import time
-import tempfile
-import base64
-import re
-from collections import deque
-from pathlib import Path
-from redbot.core import commands, Config
-from redbot.core.bot import Red
-from redbot.core.data_manager import cog_data_path
-from redbot.core.utils.chat_formatting import pagify
-from redbot.core.utils.menus import menu, DEFAULT_CONTROLS
-from typing import Optional, List, Dict
-
-# Logger
-tllogger = logging.getLogger("red.aprilai")
-tllogger.setLevel(logging.DEBUG)
-
-# Emotion GIFs repository
-EMOTION_GIFS = {
-    "happy": [
-        "https://media.giphy.com/media/XbxZ41fWLeRECPsGIJ/giphy.gif",
-        "https://media.giphy.com/media/l0HlMG1EX2H38cZeE/giphy.gif",
-        "https://media.giphy.com/media/3o7abKhOpu0NwenH3O/giphy.gif"
-    ],
-    "thinking": [
-        "https://media.giphy.com/media/d3mlimport asyncio
 import aiohttp
 import discord
 import lavalink
