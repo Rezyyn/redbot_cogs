@@ -478,9 +478,10 @@ class AprilAI(commands.Cog):
                 except Exception as e:
                     tllogger.error(f"Failed to delete TTS file: {filepath.name} — {e}")
 
-        asyncio.create_task(delayed_delete())
-    except Exception as e:
-        tllogger.exception("TTS playback failed")
+            asyncio.create_task(delayed_delete())
+
+        except Exception as e:
+            tllogger.exception("TTS playback failed")
 
     async def _cleanup_tts_file(self, path: str, delay: float):
         """Clean up TTS file after delay"""
@@ -504,7 +505,7 @@ class AprilAI(commands.Cog):
         text = re.sub(r'\*(.*?)\*', r'\1', text)      # *italic*
         text = re.sub(r'`(.*?)`', r'\1', text)        # `code`
         text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)  # code blocks
-        
+
         # Remove URLs
         text = re.sub(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', '', text)
         
