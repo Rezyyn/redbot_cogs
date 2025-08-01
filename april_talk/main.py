@@ -431,7 +431,7 @@ class AprilAI(commands.Cog):
                 await msg.edit(content=resp, embed=None)
 
     async def speak_response(self, ctx, text: str):
-        """Generate TTS and play it directly through lavalink"""
+        """Generate TTS and play it using Red's Audio cog local system"""
         tts_key = await self.config.tts_key()
         if not tts_key:
             tllogger.warning("Skipping TTS: missing API key.")
@@ -454,88 +454,113 @@ class AprilAI(commands.Cog):
                 tllogger.error("Failed to generate TTS audio")
                 return
 
-            # Create temporary file for TTS audio
-            temp_file = tempfile.NamedTemporaryFile(
-                suffix='.mp3', 
-                delete=False,
-                dir=self.tts_dir
-            )
-            
-            try:
-                temp_file.write(audio_data)
-                temp_file.flush()
-                temp_path = temp_file.name
-            finally:
-                temp_file.close()
+            # Use Red's Audio cog local tracks directory structure
+            audio_cog = self.bot.get_cog("Audio")
+            if not audio_cog:
+                tllogger.error("Audio cog not available for TTS playback")
+                return
+
+            # Get the Audio cog's local tracks directory
+            from redbot.core.data_manager import cog_data_path
+            audio_data_path = cog_data_path(audio_cog)
+            localtracks_dir = audio_data_path / "localtracks" / "april_tts"
+            localtracks_dir.mkdir(parents=True, exist_ok=True)
+
+            # Create unique filename
+            import hashlib
+            text_hash = hashlib.md5(clean_text.encode()).hexdigest()[:8]
+            filename = f"tts_{int(time.time())}_{text_hash}.mp3"
+            file_path = localtracks_dir / filename
+
+            # Write TTS audio to Red's local tracks directory
+            with open(file_path, 'wb') as f:
+                f.write(audio_data)
 
             # Track file for cleanup
-            self.tts_files.add(temp_path)
-            tllogger.debug(f"Created TTS file: {temp_path}")
+            self.tts_files.add(str(file_path))
+            tllogger.debug(f"Created TTS file in Audio localtracks: {file_path}")
 
-            # Create lavalink track from file using the modern API
-            file_uri = f"file://{temp_path}"
+            # Use Red's local track format: folder\\filename (Windows) or folder/filename (Unix)
+            local_query = f"april_tts/{filename}"
             
             try:
-                # Use the current load_tracks API (Red-Lavalink 0.11.0+)
-                result = await player.load_tracks(file_uri)
+                # Try to load using Red's local track system
+                result = await player.load_tracks(local_query)
                 
-                # Check load result and handle different outcomes
+                # Handle the LoadResult object
                 if hasattr(result, 'load_type'):
-                    # Modern LoadResult object
-                    if result.load_type.name == 'NO_MATCHES':
-                        tllogger.error("No matches found for TTS file")
-                        self._cleanup_tts_file_sync(temp_path)
-                        return
-                    elif result.load_type.name == 'LOAD_FAILED':
+                    load_type_name = result.load_type.name if hasattr(result.load_type, 'name') else str(result.load_type)
+                    
+                    if load_type_name == 'NO_MATCHES':
+                        tllogger.error("No matches found for local TTS track")
+                        # Try alternative format
+                        alt_query = f"april_tts\\{filename}" if local_query.count('/') else f"april_tts/{filename}"
+                        tllogger.debug(f"Trying alternative query format: {alt_query}")
+                        result = await player.load_tracks(alt_query)
+                        load_type_name = result.load_type.name if hasattr(result.load_type, 'name') else str(result.load_type)
+                    
+                    if load_type_name == 'LOAD_FAILED':
                         tllogger.error(f"Failed to load TTS track: {getattr(result, 'exception', 'Unknown error')}")
-                        self._cleanup_tts_file_sync(temp_path)
+                        self._cleanup_tts_file_sync(str(file_path))
+                        return
+                    elif load_type_name == 'NO_MATCHES':
+                        tllogger.error("Local TTS track not found even with alternative format")
+                        self._cleanup_tts_file_sync(str(file_path))
                         return
                     
                     tracks = result.tracks if hasattr(result, 'tracks') else []
                 else:
-                    # Fallback for older versions or different return format
+                    # Fallback for older versions
                     tracks = result if isinstance(result, (list, tuple)) else []
                 
                 if tracks:
                     track = tracks[0]
+                    
+                    # Add track to player queue
                     player.add(requester=ctx.author.id, track=track)
                     
+                    # Start playing if not already playing
                     if not player.is_playing:
                         await player.play()
                     
-                    tllogger.debug(f"Playing TTS audio: {track.title if hasattr(track, 'title') else 'TTS Track'}")
+                    tllogger.debug(f"Successfully playing TTS audio: {getattr(track, 'title', 'TTS Track')}")
                     
-                    # Schedule cleanup after the track duration + some buffer
-                    track_duration = getattr(track, 'duration', 30000) / 1000  # Convert from ms to seconds, default 30s
-                    cleanup_delay = max(track_duration + 5, 30)  # At least 30 seconds
-                    asyncio.create_task(self._cleanup_tts_file(temp_path, cleanup_delay))
+                    # Schedule cleanup after track duration + buffer
+                    track_duration = getattr(track, 'duration', 30000) / 1000  # Convert ms to seconds
+                    cleanup_delay = max(track_duration + 10, 60)  # At least 60 seconds for safety
+                    asyncio.create_task(self._cleanup_tts_file(str(file_path), cleanup_delay))
+                    
                 else:
-                    tllogger.error("No tracks returned from load_tracks")
-                    self._cleanup_tts_file_sync(temp_path)
+                    tllogger.error("No tracks returned from local TTS file")
+                    self._cleanup_tts_file_sync(str(file_path))
                     
-            except AttributeError as e:
-                if "load_tracks" in str(e):
-                    tllogger.error("load_tracks method not available - using fallback approach")
-                    # Try alternative approach using Red's Audio cog if available
-                    try:
-                        audio_cog = self.bot.get_cog("Audio")
-                        if audio_cog:
-                            # Use Red's built-in audio system as fallback
-                            await ctx.send("🔊 TTS generated but using fallback playback method")
-                        else:
-                            tllogger.error("Neither load_tracks nor Audio cog available")
-                    except Exception as fallback_error:
-                        tllogger.error(f"Fallback method also failed: {fallback_error}")
-                    
-                    self._cleanup_tts_file_sync(temp_path)
-                else:
-                    raise e
+            except Exception as load_error:
+                tllogger.error(f"Error loading TTS track: {load_error}")
+                
+                # Try using Red's play command as a last resort
+                try:
+                    tllogger.debug("Attempting fallback using Red's play command")
+                    play_cmd = self.bot.get_command("play")
+                    if play_cmd:
+                        # Create a mock context for the play command
+                        await ctx.invoke(play_cmd, query=local_query)
+                        tllogger.debug("Fallback play command succeeded")
+                        
+                        # Still schedule cleanup
+                        asyncio.create_task(self._cleanup_tts_file(str(file_path), 120))  # 2 minutes
+                    else:
+                        tllogger.error("Play command not available for fallback")
+                        self._cleanup_tts_file_sync(str(file_path))
+                        
+                except Exception as fallback_error:
+                    tllogger.error(f"Fallback play command failed: {fallback_error}")
+                    self._cleanup_tts_file_sync(str(file_path))
 
         except Exception as e:
-            tllogger.exception("TTS playback failed")
+            tllogger.exception("TTS playback failed completely")
             # Clean up file if something went wrong
-            if 'temp_path' in locals():
-                self._cleanup_tts_file_sync(temp_path)
+            if 'file_path' in locals():
+                self._cleanup_tts_file_sync(str(file_path))
 
     async def _cleanup_tts_file(self, path: str, delay: float):
         """Clean up TTS file after delay"""
