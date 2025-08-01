@@ -698,3 +698,230 @@ class AprilAI(commands.Cog):
                             channel = self.bot.get_channel(channel_id)
                             channel_name = channel.name if channel else f"Unknown ({channel_id})"
                             embed.add_field(name="Connected Channel", value=channel_name, inline=True)
+                else:
+                    embed.add_field(name="Player Access", value="❌ Failed to get player", inline=True)
+            else:
+                embed.add_field(name="Lavalink Status", value="❌ Not initialized", inline=True)
+                embed.add_field(name="Solution", value="Load the Audio cog first", inline=False)
+                
+        except Exception as e:
+            embed.add_field(name="Player Access", value=f"❌ Error: {e}", inline=False)
+        
+        # Test TTS generation
+        tts_key = await self.config.tts_key()
+        if tts_key:
+            embed.add_field(name="ElevenLabs Key", value="✅ Set", inline=True)
+            try:
+                test_audio = await self.generate_tts_audio("Test", tts_key)
+                if test_audio:
+                    embed.add_field(name="TTS Generation", value=f"✅ Success ({len(test_audio)} bytes)", inline=True)
+                else:
+                    embed.add_field(name="TTS Generation", value="❌ Failed", inline=True)
+            except Exception as e:
+                embed.add_field(name="TTS Generation", value=f"❌ Error: {str(e)[:50]}", inline=True)
+        else:
+            embed.add_field(name="ElevenLabs Key", value="❌ Not set", inline=True)
+        
+        await ctx.send(embed=embed)
+
+    @aprilconfig.command(name="settings")
+    async def show_settings(self, ctx):
+        """Show current configuration"""
+        cfg = await self.config.all()
+        e = discord.Embed(title="AprilAI Configuration", color=await ctx.embed_color())
+        
+        # Security: show partial keys
+        deepseek_key = cfg['deepseek_key']
+        anthropic_key = cfg['anthropic_key']
+        tts_key = cfg['tts_key']
+        
+        e.add_field(name="DeepSeek Key", value=f"`...{deepseek_key[-4:]}`" if deepseek_key else "❌ Not set", inline=False)
+        e.add_field(name="Anthropic Key", value=f"`...{anthropic_key[-4:]}`" if anthropic_key else "❌ Not set", inline=False)
+        e.add_field(name="ElevenLabs Key", value=f"`...{tts_key[-4:]}`" if tts_key else "❌ Not set", inline=False)
+        e.add_field(name="Voice ID", value=f"`{cfg['voice_id']}`", inline=True)
+        e.add_field(name="Model", value=f"`{cfg['model']}`", inline=True)
+        e.add_field(name="Temperature", value=f"`{cfg['temperature']}`", inline=True)
+        e.add_field(name="Max Tokens", value=f"`{cfg['max_tokens']}`", inline=True)
+        e.add_field(name="Max History", value=f"`{cfg['max_history']} exchanges`", inline=True)
+        e.add_field(name="Max Message Length", value=f"`{cfg['max_message_length']}`", inline=True)
+        e.add_field(name="TTS Enabled", value="✅" if cfg['tts_enabled'] else "❌", inline=True)
+        e.add_field(name="Text with Voice", value="✅" if cfg['text_response_when_voice'] else "❌", inline=True)
+        e.add_field(name="Emotion GIFs", value="✅" if cfg['use_gifs'] else "❌", inline=True)
+        
+        prompt_preview = cfg['system_prompt'][:200] + ("..." if len(cfg['system_prompt']) > 200 else "")
+        e.add_field(name="System Prompt", value=f"```{prompt_preview}```", inline=False)
+        
+        smert_preview = cfg['smert_prompt'][:200] + ("..." if len(cfg['smert_prompt']) > 200 else "")
+        e.add_field(name="Smert Prompt", value=f"```{smert_preview}```", inline=False)
+        
+        await ctx.send(embed=e)
+
+    @commands.group(name="apriluser")
+    async def apriluser(self, ctx):
+        """User-specific AprilAI settings"""
+        if ctx.invoked_subcommand is None:
+            await self.show_user_settings(ctx)
+
+    @apriluser.command(name="setkey")
+    async def set_user_key(self, ctx, key: str):
+        """Set your personal Anthropic API key for smert mode"""
+        await self.config.user(ctx.author).custom_anthropic_key.set(key)
+        await ctx.tick()
+        try:
+            await ctx.message.delete()
+        except:
+            pass
+
+    @apriluser.command(name="setprompt")
+    async def set_user_prompt(self, ctx, *, prompt: str):
+        """Set your personal smert mode prompt"""
+        await self.config.user(ctx.author).custom_smert_prompt.set(prompt)
+        await ctx.send("✅ Your personal smert prompt has been set")
+
+    @apriluser.command(name="settings")
+    async def show_user_settings(self, ctx):
+        """Show your personal settings"""
+        user_cfg = await self.config.user(ctx.author).all()
+        
+        e = discord.Embed(
+            title=f"AprilAI Settings for {ctx.author.display_name}",
+            color=await ctx.embed_color()
+        )
+        
+        e.add_field(name="Smert Mode", value="✅ Active" if user_cfg['smert_mode'] else "❌ Inactive", inline=True)
+        
+        custom_key = user_cfg['custom_anthropic_key']
+        e.add_field(
+            name="Personal Anthropic Key", 
+            value=f"`...{custom_key[-4:]}`" if custom_key else "❌ Not set", 
+            inline=True
+        )
+        
+        if user_cfg['custom_smert_prompt']:
+            prompt_preview = user_cfg['custom_smert_prompt'][:200] + ("..." if len(user_cfg['custom_smert_prompt']) > 200 else "")
+            e.add_field(name="Personal Smert Prompt", value=f"```{prompt_preview}```", inline=False)
+        else:
+            e.add_field(name="Personal Smert Prompt", value="Using default smert prompt", inline=False)
+        
+        await ctx.send(embed=e)
+
+    async def query_deepseek(self, user_id: int, messages: list):
+        """Query DeepSeek API"""
+        key = await self.config.deepseek_key()
+        if not key: 
+            raise Exception("DeepSeek API key not set. Use `[p]aprilconfig deepseekkey <key>`")
+            
+        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+        payload = {
+            "model": await self.config.model(),
+            "messages": messages,
+            "temperature": await self.config.temperature(),
+            "max_tokens": await self.config.max_tokens(),
+            "user": str(user_id)
+        }
+        
+        try:
+            async with self.session.post(
+                "https://api.deepseek.com/v1/chat/completions", 
+                json=payload,
+                headers=headers, 
+                timeout=60  # Increased timeout for large responses
+            ) as r:
+                if r.status != 200:
+                    error_data = await r.json()
+                    err_msg = error_data.get("error", {}).get("message", f"HTTP Error {r.status}")
+                    raise Exception(f"API Error: {err_msg}")
+                
+                data = await r.json()
+                return data["choices"][0]["message"]["content"].strip()
+        except asyncio.TimeoutError:
+            raise Exception("API request timed out - try reducing max_tokens")
+        except Exception as e:
+            raise Exception(f"API Error: {str(e)}")
+
+    async def query_anthropic(self, user_id: int, messages: list):
+        """Query Anthropic Claude API for smert mode"""
+        # Check for user's custom key first
+        user = self.bot.get_user(user_id)
+        if user:
+            custom_key = await self.config.user(user).custom_anthropic_key()
+            if custom_key:
+                key = custom_key
+            else:
+                key = await self.config.anthropic_key()
+        else:
+            key = await self.config.anthropic_key()
+            
+        if not key:
+            raise Exception("Anthropic API key not set. Use `[p]aprilconfig anthropickey <key>` or `[p]apriluser setkey <key>`")
+        
+        headers = {
+            "x-api-key": key,
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json"
+        }
+        
+        # Convert messages format (remove system message and add it to the first user message)
+        system_content = None
+        converted_messages = []
+        
+        for msg in messages:
+            if msg["role"] == "system":
+                system_content = msg["content"]
+            else:
+                converted_messages.append(msg)
+        
+        # Prepend system content to first user message if exists
+        if system_content and converted_messages:
+            if converted_messages[0]["role"] == "user":
+                converted_messages[0]["content"] = f"{system_content}\n\n{converted_messages[0]['content']}"
+        
+        payload = {
+            "model": "claude-3-5-sonnet-20241022",  # Latest Claude model
+            "messages": converted_messages,
+            "max_tokens": await self.config.max_tokens(),
+            "temperature": await self.config.temperature()
+        }
+        
+        try:
+            async with self.session.post(
+                "https://api.anthropic.com/v1/messages",
+                json=payload,
+                headers=headers,
+                timeout=60
+            ) as r:
+                if r.status != 200:
+                    error_text = await r.text()
+                    raise Exception(f"Anthropic API Error {r.status}: {error_text}")
+                
+                data = await r.json()
+                return data["content"][0]["text"].strip()
+        except asyncio.TimeoutError:
+            raise Exception("API request timed out - try reducing max_tokens")
+        except Exception as e:
+            raise Exception(f"API Error: {str(e)}")
+
+    @commands.Cog.listener()
+    async def on_voice_state_update(self, member, before, after):
+        """Handle voice state updates"""
+        if member.bot:
+            return
+            
+        try:
+            player = self.get_player(member.guild.id)
+            if player and self.is_player_connected(player):
+                # Check if only bot remains in voice
+                channel_id = self.get_player_channel_id(player)
+                if channel_id:
+                    voice_channel = self.bot.get_channel(channel_id)
+                    if voice_channel:
+                        human_members = [m for m in voice_channel.members if not m.bot]
+                        if len(human_members) == 0:
+                            await player.disconnect()
+                            tllogger.debug(f"Left voice in {member.guild} (empty channel)")
+        except Exception as e:
+            tllogger.error(f"Error handling voice state update: {e}")
+
+async def setup(bot):
+    """Set up the cog"""
+    await bot.add_cog(AprilAI(bot))
