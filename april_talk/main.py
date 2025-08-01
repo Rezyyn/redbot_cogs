@@ -736,7 +736,18 @@ class AprilAI(commands.Cog):
         """Set your personal smert mode prompt"""
         await self.config.user(ctx.author).custom_smert_prompt.set(prompt)
         await ctx.send("✅ Your personal smert prompt has been set")
+        
+    @aprilconfig.command(name="toggletts")
+    @commands.is_owner()
+    async def toggle_tts(self, ctx):
+        """Toggle TTS on or off dynamically"""
+        current = await self.config.tts_enabled()
+        new_value = not current
+        await self.config.tts_enabled.set(new_value)
 
+        status = "enabled" if new_value else "disabled"
+        await ctx.send(f"🔁 TTS has been **{status}**.")
+        
     @apriluser.command(name="settings")
     async def show_user_settings(self, ctx):
         """Show your personal settings"""
