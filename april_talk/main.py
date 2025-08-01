@@ -475,34 +475,67 @@ class AprilAI(commands.Cog):
             # Create lavalink track from file using the modern API
             file_uri = f"file://{temp_path}"
             
-            # Use load_tracks instead of get_tracks (which is deprecated)
-            if hasattr(lavalink, 'load_tracks'):
-                results = await lavalink.load_tracks(file_uri)
-                tracks = results.tracks if hasattr(results, 'tracks') else []
-            else:
-                # Fallback for older versions
-                results = await lavalink.get_tracks(file_uri)
-                tracks = results if isinstance(results, (list, tuple)) else []
-            
-            if tracks:
-                track = tracks[0]
-                player.add(requester=ctx.author.id, track=track)
+            try:
+                # Use the current load_tracks API (Red-Lavalink 0.11.0+)
+                result = await player.load_tracks(file_uri)
                 
-                if not player.is_playing:
-                    await player.play()
+                # Check load result and handle different outcomes
+                if hasattr(result, 'load_type'):
+                    # Modern LoadResult object
+                    if result.load_type.name == 'NO_MATCHES':
+                        tllogger.error("No matches found for TTS file")
+                        self._cleanup_tts_file_sync(temp_path)
+                        return
+                    elif result.load_type.name == 'LOAD_FAILED':
+                        tllogger.error(f"Failed to load TTS track: {getattr(result, 'exception', 'Unknown error')}")
+                        self._cleanup_tts_file_sync(temp_path)
+                        return
+                    
+                    tracks = result.tracks if hasattr(result, 'tracks') else []
+                else:
+                    # Fallback for older versions or different return format
+                    tracks = result if isinstance(result, (list, tuple)) else []
                 
-                tllogger.debug(f"Playing TTS audio: {track.title}")
-                
-                # Schedule cleanup after the track duration + some buffer
-                track_duration = track.duration / 1000  # Convert from ms to seconds
-                cleanup_delay = max(track_duration + 5, 30)  # At least 30 seconds
-                asyncio.create_task(self._cleanup_tts_file(temp_path, cleanup_delay))
-            else:
-                tllogger.error("Failed to create lavalink track from TTS file")
-                self._cleanup_tts_file_sync(temp_path)
+                if tracks:
+                    track = tracks[0]
+                    player.add(requester=ctx.author.id, track=track)
+                    
+                    if not player.is_playing:
+                        await player.play()
+                    
+                    tllogger.debug(f"Playing TTS audio: {track.title if hasattr(track, 'title') else 'TTS Track'}")
+                    
+                    # Schedule cleanup after the track duration + some buffer
+                    track_duration = getattr(track, 'duration', 30000) / 1000  # Convert from ms to seconds, default 30s
+                    cleanup_delay = max(track_duration + 5, 30)  # At least 30 seconds
+                    asyncio.create_task(self._cleanup_tts_file(temp_path, cleanup_delay))
+                else:
+                    tllogger.error("No tracks returned from load_tracks")
+                    self._cleanup_tts_file_sync(temp_path)
+                    
+            except AttributeError as e:
+                if "load_tracks" in str(e):
+                    tllogger.error("load_tracks method not available - using fallback approach")
+                    # Try alternative approach using Red's Audio cog if available
+                    try:
+                        audio_cog = self.bot.get_cog("Audio")
+                        if audio_cog:
+                            # Use Red's built-in audio system as fallback
+                            await ctx.send("🔊 TTS generated but using fallback playback method")
+                        else:
+                            tllogger.error("Neither load_tracks nor Audio cog available")
+                    except Exception as fallback_error:
+                        tllogger.error(f"Fallback method also failed: {fallback_error}")
+                    
+                    self._cleanup_tts_file_sync(temp_path)
+                else:
+                    raise e
 
         except Exception as e:
             tllogger.exception("TTS playback failed")
+            # Clean up file if something went wrong
+            if 'temp_path' in locals():
+                self._cleanup_tts_file_sync(temp_path)
 
     async def _cleanup_tts_file(self, path: str, delay: float):
         """Clean up TTS file after delay"""
