@@ -479,7 +479,6 @@ class AprilAI(commands.Cog):
                     tllogger.error(f"Failed to delete TTS file: {filepath.name} — {e}")
 
         asyncio.create_task(delayed_delete())
-
     except Exception as e:
         tllogger.exception("TTS playback failed")
 
