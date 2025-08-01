@@ -240,8 +240,8 @@ class AprilAI(commands.Cog):
         
         try:
             # Check if lavalink is available
-            if not hasattr(lavalink, 'NodeManager') and not hasattr(lavalink, '_lavalink'):
-                return await ctx.send("❌ Lavalink is not initialized. Please load the Audio cog first.")
+            if not hasattr(lavalink, 'get_player'):
+                return await ctx.send("❌ Lavalink is not initialized. Please load the Audio cog first with `[p]load audio`")
             
             # Try to get existing player first
             player = self.get_player(ctx.guild.id)
@@ -458,13 +458,20 @@ class AprilAI(commands.Cog):
             self.tts_files.add(temp_path)
             tllogger.debug(f"Created TTS file: {temp_path}")
 
-            # Create lavalink track from file
+            # Create lavalink track from file using the modern API
             file_uri = f"file://{temp_path}"
             
-            # Load and play the track
-            results = await lavalink.get_tracks(file_uri)
-            if results and results.tracks:
-                track = results.tracks[0]
+            # Use load_tracks instead of get_tracks (which is deprecated)
+            if hasattr(lavalink, 'load_tracks'):
+                results = await lavalink.load_tracks(file_uri)
+                tracks = results.tracks if hasattr(results, 'tracks') else []
+            else:
+                # Fallback for older versions
+                results = await lavalink.get_tracks(file_uri)
+                tracks = results if isinstance(results, (list, tuple)) else []
+            
+            if tracks:
+                track = tracks[0]
                 player.add(requester=ctx.author.id, track=track)
                 
                 if not player.is_playing:
@@ -681,7 +688,7 @@ class AprilAI(commands.Cog):
         
         try:
             # Check lavalink initialization
-            if hasattr(lavalink, 'NodeManager') or hasattr(lavalink, '_lavalink'):
+            if hasattr(lavalink, 'get_player'):
                 embed.add_field(name="Lavalink Status", value="✅ Initialized", inline=True)
                 
                 # Test getting a player
@@ -702,7 +709,7 @@ class AprilAI(commands.Cog):
                     embed.add_field(name="Player Access", value="❌ Failed to get player", inline=True)
             else:
                 embed.add_field(name="Lavalink Status", value="❌ Not initialized", inline=True)
-                embed.add_field(name="Solution", value="Load the Audio cog first", inline=False)
+                embed.add_field(name="Solution", value="Load the Audio cog first with `[p]load audio`", inline=False)
                 
         except Exception as e:
             embed.add_field(name="Player Access", value=f"❌ Error: {e}", inline=False)
@@ -861,27 +868,27 @@ class AprilAI(commands.Cog):
             "Content-Type": "application/json"
         }
         
-        # Convert messages format (remove system message and add it to the first user message)
+        # Extract system message and user/assistant messages
         system_content = None
-        converted_messages = []
+        conversation_messages = []
         
         for msg in messages:
             if msg["role"] == "system":
                 system_content = msg["content"]
             else:
-                converted_messages.append(msg)
+                conversation_messages.append(msg)
         
-        # Prepend system content to first user message if exists
-        if system_content and converted_messages:
-            if converted_messages[0]["role"] == "user":
-                converted_messages[0]["content"] = f"{system_content}\n\n{converted_messages[0]['content']}"
-        
+        # Build the payload with proper format for latest Anthropic API
         payload = {
-            "model": "claude-3-5-sonnet-20241022",  # Latest Claude model
-            "messages": converted_messages,
+            "model": "claude-3-5-sonnet-20241022",  # Latest stable Claude model
+            "messages": conversation_messages,
             "max_tokens": await self.config.max_tokens(),
             "temperature": await self.config.temperature()
         }
+        
+        # Add system prompt if it exists
+        if system_content:
+            payload["system"] = system_content
         
         try:
             async with self.session.post(
