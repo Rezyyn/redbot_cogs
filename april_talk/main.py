@@ -430,58 +430,62 @@ class AprilAI(commands.Cog):
             else:
                 await msg.edit(content=resp, embed=None)
 
-    async def speak_response(self, ctx, text: str):
-        """Generate TTS, play via local command, and clean up"""
-        tts_key = await self.config.tts_key()
-        if not tts_key:
-            tllogger.warning("Skipping TTS: missing API key.")
+async def speak_response(self, ctx, text: str):
+    """Generate TTS, play via local command, and clean up"""
+    tts_key = await self.config.tts_key()
+    if not tts_key:
+        tllogger.warning("Skipping TTS: missing API key.")
+        return
+
+    try:
+        # Verify voice connection
+        player = self.get_player(ctx.guild.id)
+        if not self.is_player_connected(player):
+            tllogger.warning("Skipping TTS: Player not connected.")
             return
 
-        try:
-            # Verify voice connection
-            player = self.get_player(ctx.guild.id)
-            if not self.is_player_connected(player):
-                tllogger.warning("Skipping TTS: Player not connected.")
-                return
+        # Clean and generate TTS
+        clean_text = self.clean_text_for_tts(text)
+        if not clean_text.strip():
+            return
 
-            # Clean and generate TTS
-            clean_text = self.clean_text_for_tts(text)
-            if not clean_text.strip():
-                return
+        audio_data = await self.generate_tts_audio(clean_text, tts_key)
+        if not audio_data:
+            tllogger.error("Failed to generate TTS audio")
+            return
 
-            audio_data = await self.generate_tts_audio(clean_text, tts_key)
-            if not audio_data:
-                tllogger.error("Failed to generate TTS audio")
-                return
+        # Prepare path in Red's required localtracks folder
+        localtrack_dir = cog_data_path(self).parent / "Audio" / "localtracks" / "april_tts"
+        localtrack_dir.mkdir(parents=True, exist_ok=True)
 
-            # Prepare path in Red's required localtracks folder
-            localtrack_dir = cog_data_path(self).parent / "Audio" / "localtracks" / "april_tts"  # FIXED
-            localtrack_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"tts_{int(time.time())}_{random.randint(1000, 9999)}.mp3"
+        filepath = localtrack_dir / filename
 
-            filename = f"tts_{int(time.time())}_{random.randint(1000, 9999)}.mp3"
-            filepath = localtrack_dir / filename
+        with open(filepath, 'wb') as f:
+            f.write(audio_data)
 
-            with open(filepath, 'wb') as f:
-                f.write(audio_data)
+        tllogger.debug(f"TTS audio saved: {filepath.name}")
 
-            tllogger.debug(f"TTS audio saved: {filepath.name}")
+        # Play the specific file using the correct command format
+        # The correct way is to use "local play" with the full path
+        await ctx.invoke(
+            ctx.bot.get_command("local play"),
+            f"april_tts/{filename}"  # Pass the relative path to the file
+        )
 
-            # Play using Red's local playlist
-            await ctx.invoke(ctx.bot.get_command("local start"), "april_tts")  # FIXED
+        # Delay then delete file
+        async def delayed_delete():
+            await asyncio.sleep(30)  # Reduced to 30 seconds for testing
+            try:
+                filepath.unlink()
+                tllogger.debug(f"TTS file deleted: {filepath.name}")
+            except Exception as e:
+                tllogger.error(f"Failed to delete TTS file: {filepath.name} — {e}")
 
-            # Delay then delete file
-            async def delayed_delete():
-                await asyncio.sleep(1800)
-                try:
-                    filepath.unlink()
-                    tllogger.debug(f"TTS file deleted: {filepath.name}")
-                except Exception as e:
-                    tllogger.error(f"Failed to delete TTS file: {filepath.name} — {e}")
+        asyncio.create_task(delayed_delete())
 
-            asyncio.create_task(delayed_delete())
-
-        except Exception as e:
-            tllogger.exception("TTS playback failed")
+    except Exception as e:
+        tllogger.exception("TTS playback failed")
 
     async def _cleanup_tts_file(self, path: str, delay: float):
         """Clean up TTS file after delay"""
