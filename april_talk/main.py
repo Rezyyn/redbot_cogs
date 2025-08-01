@@ -201,10 +201,10 @@ class AprilAI(commands.Cog):
                 )
             
             await user_config.smert_mode.set(True)
-            await ctx.send("🧠 Smert mode activated! I'm now using Claude for enhanced intelligence.")
+            await ctx.send("🧠 Smert mode activated! I FOUND A FUCKING BOOK")
         else:
             await user_config.smert_mode.set(False)
-            await ctx.send("💡 Smert mode deactivated. Back to regular mode.")
+            await ctx.send("💡 Smert mode deactivated. HELLO OWEN, YOU'RE BACK!")
 
     @april.command(name="clearhistory")
     async def clear_history(self, ctx):
