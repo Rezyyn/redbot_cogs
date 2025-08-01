@@ -697,4 +697,4 @@ class AprilAI(commands.Cog):
                         if channel_id:
                             channel = self.bot.get_channel(channel_id)
                             channel_name = channel.name if channel else f"Unknown ({channel_id})"
-                            embed.add_field(name="Connected Channel", value=channel_name, inline=True
+                            embed.add_field(name="Connected Channel", value=channel_name, inline=True)
