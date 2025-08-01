@@ -131,7 +131,13 @@ class AprilAI(commands.Cog):
     def get_player(self, guild_id: int):
         """Get player for a guild using lavalink"""
         try:
-            return lavalink.get_player(guild_id)
+            if hasattr(lavalink, 'get_player'):
+                player = lavalink.get_player(guild_id)
+                tllogger.debug(f"Got player for guild {guild_id}: {player}")
+                return player
+            else:
+                tllogger.error("lavalink.get_player not available")
+                return None
         except Exception as e:
             tllogger.error(f"Failed to get player for guild {guild_id}: {e}")
             return None
@@ -289,6 +295,7 @@ class AprilAI(commands.Cog):
             try:
                 player = self.get_player(ctx.guild.id)
                 use_voice = player and self.is_player_connected(player)
+                tllogger.debug(f"TTS check - player: {player}, connected: {use_voice}")
             except:
                 use_voice = False
         
@@ -328,13 +335,20 @@ class AprilAI(commands.Cog):
                 self.history[channel_id].append({"role": "user", "content": input_text})
                 self.history[channel_id].append({"role": "assistant", "content": resp})
                 
-                # Send response
+                # Start both text and voice simultaneously for natural conversation feel
+                tasks = []
+                
+                # Always send text response (unless specifically disabled for voice)
                 if not (use_voice and not await self.config.text_response_when_voice()):
-                    await self.send_streamed_response(ctx, resp)
+                    tasks.append(asyncio.create_task(self.send_streamed_response(ctx, resp)))
                 
                 # Send voice response if enabled and connected
                 if use_voice:
-                    await self.speak_response(ctx, resp)
+                    tasks.append(asyncio.create_task(self.speak_response(ctx, resp)))
+                
+                # Wait for both to complete
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
                     
             except Exception as e:
                 tllogger.exception("process_query error")
@@ -691,28 +705,37 @@ class AprilAI(commands.Cog):
             if hasattr(lavalink, 'get_player'):
                 embed.add_field(name="Lavalink Status", value="✅ Initialized", inline=True)
                 
-                # Test getting a player
-                player = self.get_player(ctx.guild.id)
-                if player:
-                    embed.add_field(name="Player Access", value="✅ Success", inline=True)
-                    
-                    is_connected = self.is_player_connected(player)
-                    embed.add_field(name="Player Connected", value="✅ Yes" if is_connected else "❌ No", inline=True)
-                    
-                    if is_connected:
-                        channel_id = self.get_player_channel_id(player)
-                        if channel_id:
-                            channel = self.bot.get_channel(channel_id)
-                            channel_name = channel.name if channel else f"Unknown ({channel_id})"
-                            embed.add_field(name="Connected Channel", value=channel_name, inline=True)
-                else:
-                    embed.add_field(name="Player Access", value="❌ Failed to get player", inline=True)
+                # Test getting a player with better error handling
+                try:
+                    player = self.get_player(ctx.guild.id)
+                    if player is not None:
+                        embed.add_field(name="Player Access", value="✅ Success", inline=True)
+                        
+                        is_connected = self.is_player_connected(player)
+                        embed.add_field(name="Player Connected", value="✅ Yes" if is_connected else "❌ No", inline=True)
+                        
+                        if is_connected:
+                            try:
+                                channel_id = self.get_player_channel_id(player)
+                                if channel_id:
+                                    channel = self.bot.get_channel(channel_id)
+                                    channel_name = channel.name if channel else f"Unknown ({channel_id})"
+                                    embed.add_field(name="Connected Channel", value=channel_name, inline=True)
+                                else:
+                                    embed.add_field(name="Connected Channel", value="❌ No channel ID", inline=True)
+                            except Exception as e:
+                                embed.add_field(name="Connected Channel", value=f"❌ Error: {e}", inline=True)
+                    else:
+                        embed.add_field(name="Player Access", value="❌ Player is None", inline=True)
+                        embed.add_field(name="Note", value="Try using `[p]april join` first", inline=True)
+                except Exception as e:
+                    embed.add_field(name="Player Access", value=f"❌ Exception: {e}", inline=True)
             else:
                 embed.add_field(name="Lavalink Status", value="❌ Not initialized", inline=True)
                 embed.add_field(name="Solution", value="Load the Audio cog first with `[p]load audio`", inline=False)
                 
         except Exception as e:
-            embed.add_field(name="Player Access", value=f"❌ Error: {e}", inline=False)
+            embed.add_field(name="Debug Error", value=f"❌ Error: {e}", inline=False)
         
         # Test TTS generation
         tts_key = await self.config.tts_key()
@@ -728,6 +751,10 @@ class AprilAI(commands.Cog):
                 embed.add_field(name="TTS Generation", value=f"❌ Error: {str(e)[:50]}", inline=True)
         else:
             embed.add_field(name="ElevenLabs Key", value="❌ Not set", inline=True)
+        
+        # Add guild info for debugging
+        embed.add_field(name="Guild ID", value=f"`{ctx.guild.id}`", inline=True)
+        embed.add_field(name="Bot Voice State", value="✅ Connected" if ctx.guild.voice_client else "❌ Not connected", inline=True)
         
         await ctx.send(embed=embed)
 
