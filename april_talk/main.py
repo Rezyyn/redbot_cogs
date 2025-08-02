@@ -430,7 +430,7 @@ class AprilAI(commands.Cog):
             else:
                 await msg.edit(content=resp, embed=None)
 
-async def speak_response(self, ctx, text: str):
+    async def speak_response(self, ctx, text: str):
     """Generate TTS, play via local command, and clean up"""
     tts_key = await self.config.tts_key()
     if not tts_key:
@@ -464,21 +464,26 @@ async def speak_response(self, ctx, text: str):
         with open(filepath, 'wb') as f:
             f.write(audio_data)
 
-        tllogger.debug(f"TTS audio saved: {filepath.name}")
+        tllogger.debug(f"TTS audio saved: {filepath}")
 
-        # Play the specific file using the correct command format
-        # The correct way is to use "local play" with the full path
-        await ctx.invoke(
-            ctx.bot.get_command("local play"),
-            f"april_tts/{filename}"  # Pass the relative path to the file
-        )
+        # Play using the correct local command format
+        # Option 1: Use 'play' command with local path
+        await ctx.invoke(ctx.bot.get_command("play"), f"localtracks/april_tts/{filename}")
+        
+        # Alternative Option 2: Use 'local play' with the relative path
+        # local_cmd = ctx.bot.get_command("local")
+        # if local_cmd:
+        #     play_cmd = local_cmd.get_command("play")
+        #     if play_cmd:
+        #         await ctx.invoke(play_cmd, f"april_tts/{filename}")
 
         # Delay then delete file
         async def delayed_delete():
-            await asyncio.sleep(30)  # Reduced to 30 seconds for testing
+            await asyncio.sleep(30)  # Reduced to 30 seconds for faster cleanup
             try:
-                filepath.unlink()
-                tllogger.debug(f"TTS file deleted: {filepath.name}")
+                if filepath.exists():
+                    filepath.unlink()
+                    tllogger.debug(f"TTS file deleted: {filepath.name}")
             except Exception as e:
                 tllogger.error(f"Failed to delete TTS file: {filepath.name} — {e}")
 
