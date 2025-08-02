@@ -431,66 +431,6 @@ class AprilAI(commands.Cog):
                 await msg.edit(content=resp, embed=None)
 
     async def speak_response(self, ctx, text: str):
-    """Generate TTS, play via local command, and clean up"""
-    tts_key = await self.config.tts_key()
-    if not tts_key:
-        tllogger.warning("Skipping TTS: missing API key.")
-        return
-
-    try:
-        # Verify voice connection
-        player = self.get_player(ctx.guild.id)
-        if not self.is_player_connected(player):
-            tllogger.warning("Skipping TTS: Player not connected.")
-            return
-
-        # Clean and generate TTS
-        clean_text = self.clean_text_for_tts(text)
-        if not clean_text.strip():
-            return
-
-        audio_data = await self.generate_tts_audio(clean_text, tts_key)
-        if not audio_data:
-            tllogger.error("Failed to generate TTS audio")
-            return
-
-        # Prepare path in Red's required localtracks folder
-        localtrack_dir = cog_data_path(self).parent / "Audio" / "localtracks" / "april_tts"
-        localtrack_dir.mkdir(parents=True, exist_ok=True)
-
-        filename = f"tts_{int(time.time())}_{random.randint(1000, 9999)}.mp3"
-        filepath = localtrack_dir / filename
-
-        with open(filepath, 'wb') as f:
-            f.write(audio_data)
-
-        tllogger.debug(f"TTS audio saved: {filepath}")
-
-        # Play using the correct local command format
-        # Option 1: Use 'play' command with local path
-        await ctx.invoke(ctx.bot.get_command("play"), f"localtracks/april_tts/{filename}")
-        
-        # Alternative Option 2: Use 'local play' with the relative path
-        # local_cmd = ctx.bot.get_command("local")
-        # if local_cmd:
-        #     play_cmd = local_cmd.get_command("play")
-        #     if play_cmd:
-        #         await ctx.invoke(play_cmd, f"april_tts/{filename}")
-
-        # Delay then delete file
-        async def delayed_delete():
-            await asyncio.sleep(30)  # Reduced to 30 seconds for faster cleanup
-            try:
-                if filepath.exists():
-                    filepath.unlink()
-                    tllogger.debug(f"TTS file deleted: {filepath.name}")
-            except Exception as e:
-                tllogger.error(f"Failed to delete TTS file: {filepath.name} — {e}")
-
-        asyncio.create_task(delayed_delete())
-
-    except Exception as e:
-        tllogger.exception("TTS playback failed")
         """Generate TTS, play via local command, and clean up"""
         tts_key = await self.config.tts_key()
         if not tts_key:
@@ -515,7 +455,7 @@ class AprilAI(commands.Cog):
                 return
 
             # Prepare path in Red's required localtracks folder
-            localtrack_dir = cog_data_path(self).parent / "Audio" / "localtracks" / "april_tts"  # FIXED
+            localtrack_dir = cog_data_path(self).parent / "Audio" / "localtracks" / "april_tts"
             localtrack_dir.mkdir(parents=True, exist_ok=True)
 
             filename = f"tts_{int(time.time())}_{random.randint(1000, 9999)}.mp3"
@@ -524,17 +464,18 @@ class AprilAI(commands.Cog):
             with open(filepath, 'wb') as f:
                 f.write(audio_data)
 
-            tllogger.debug(f"TTS audio saved: {filepath.name}")
+            tllogger.debug(f"TTS audio saved: {filepath}")
 
-            # Play using Red's local playlist
-            await ctx.invoke(ctx.bot.get_command("local start"), "april_tts")  # FIXED
+            # Play using the correct local command format
+            await ctx.invoke(ctx.bot.get_command("play"), f"localtracks/april_tts/{filename}")
 
             # Delay then delete file
             async def delayed_delete():
-                await asyncio.sleep(1800)
+                await asyncio.sleep(30)  # Reduced to 30 seconds for faster cleanup
                 try:
-                    filepath.unlink()
-                    tllogger.debug(f"TTS file deleted: {filepath.name}")
+                    if filepath.exists():
+                        filepath.unlink()
+                        tllogger.debug(f"TTS file deleted: {filepath.name}")
                 except Exception as e:
                     tllogger.error(f"Failed to delete TTS file: {filepath.name} — {e}")
 
