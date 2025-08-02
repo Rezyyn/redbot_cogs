@@ -590,6 +590,17 @@ class AprilAI(commands.Cog):
             await ctx.message.delete()
         except:
             pass
+    @commands.command()
+    async def play_tts(self, ctx, filename: str):
+        """Play a TTS file from the april_tts folder."""
+        audio_cog = self.bot.get_cog("Audio")
+    if not audio_cog:
+        await ctx.send("Audio cog not loaded.")
+        return
+
+    # Play specific file from april_tts folder
+    query = f"april_tts/{filename}"
+        await ctx.invoke(audio_cog.play, query=query)
 
     @aprilconfig.command()
     async def voice(self, ctx, voice_id: str):
