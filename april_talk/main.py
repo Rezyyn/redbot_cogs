@@ -466,8 +466,14 @@ class AprilAI(commands.Cog):
 
             tllogger.debug(f"TTS audio saved: {filepath}")
 
-            # Play using the correct local command format
-            await ctx.invoke(ctx.bot.get_command("play"), query=f"localtracks/april_tts/{filename}")
+            # Play using the Audio cog directly
+            audio_cog = self.bot.get_cog("Audio")
+            if audio_cog:
+                play_command = audio_cog.command_play
+                await play_command(ctx, query=f"localtracks/april_tts/{filename}")
+            else:
+                tllogger.error("Audio cog not found")
+                return
 
             # Delay then delete file
             async def delayed_delete():
