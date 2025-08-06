@@ -467,7 +467,7 @@ class AprilAI(commands.Cog):
             tllogger.debug(f"TTS audio saved: {filepath}")
 
             # Play using the correct local command format
-            await ctx.invoke(ctx.bot.get_command("play"), f"localtracks/april_tts/{filename}")
+            await ctx.invoke(ctx.bot.get_command("play"), query=f"localtracks/april_tts/{filename}")
 
             # Delay then delete file
             async def delayed_delete():
@@ -516,7 +516,7 @@ class AprilAI(commands.Cog):
         # Limit length to avoid API issues
         if len(text) > 1000:
             text = text[:1000].rsplit(' ', 1)[0] + "..."
-        
+
         return text
 
     async def generate_tts_audio(self, text: str, api_key: str) -> bytes:
@@ -524,7 +524,7 @@ class AprilAI(commands.Cog):
         try:
             voice_id = await self.config.voice_id()
             url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
-            
+
             payload = {
                 "text": text,
                 "voice_settings": {
@@ -537,9 +537,9 @@ class AprilAI(commands.Cog):
                 "xi-api-key": api_key,
                 "Content-Type": "application/json"
             }
-            
+
             tllogger.debug(f"Requesting TTS for text: {text[:100]}...")
-            
+
             async with self.session.post(url, json=payload, headers=headers, timeout=30) as resp:
                 if resp.status == 200:
                     audio_data = await resp.read()
@@ -549,7 +549,7 @@ class AprilAI(commands.Cog):
                     error_text = await resp.text()
                     tllogger.error(f"TTS API error {resp.status}: {error_text}")
                     return None
-                    
+
         except Exception as e:
             tllogger.error(f"TTS generation failed: {e}")
             return None
