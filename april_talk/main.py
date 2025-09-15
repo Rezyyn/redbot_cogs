@@ -231,7 +231,30 @@ class AprilAI(commands.Cog):
         if channel_id in self.history:
             self.history[channel_id].clear()
         await ctx.send("✅ Conversation history cleared for this channel.")
-
+    @april.command(name="draw")
+    @commands.cooldown(1, 10, commands.BucketType.user)
+    async def april_draw(self, ctx: commands.Context, *, prompt: str):
+        """
+        Draw an image with OpenAI. Usage:
+          .april draw a neon fox in the rain
+          .april draw me a neon fox in the rain
+        """
+        # allow "draw me ..." or just "draw ..."
+        p = prompt.strip()
+        if p.lower().startswith("me "):
+            p = p[3:].strip()
+    
+        try:
+            async with ctx.typing():
+                png_bytes = await self.generate_openai_image_png(p, size="1024x1024")
+                file = discord.File(BytesIO(png_bytes), filename="april_draw.png")
+                await ctx.send(content=f"**Prompt:** {p}", file=file)
+        except Exception as e:
+            tllogger.exception("April group draw failed")
+            await ctx.send(
+                f"⚠️ I couldn't draw that: `{e}`\n"
+                "Set the key with `[p]aprilconfig openaikey <key>` if needed."
+            )        
     @april.command(name="join")
     async def join_voice(self, ctx):
         """Join voice channel"""
