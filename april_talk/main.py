@@ -11,6 +11,7 @@ import base64
 import re
 from collections import deque
 from pathlib import Path
+from io import BytesIO
 from redbot.core import commands, Config
 from redbot.core.bot import Red
 from redbot.core.data_manager import cog_data_path
@@ -85,6 +86,7 @@ class AprilAI(commands.Cog):
             max_history=5,  # Default 5 exchanges
             use_gifs=True,
             max_message_length=1800,  # For splitting long messages
+            openai_key="",  # <-- for Draw image generation
         )
         
         self.config.register_user(
@@ -560,6 +562,92 @@ class AprilAI(commands.Cog):
             tllogger.error(f"TTS generation failed: {e}")
             return None
 
+    # -----------------------
+    # OpenAI IMAGE GENERATION
+    # -----------------------
+    async def generate_openai_image_png(self, prompt: str, size: str = "1024x1024") -> bytes:
+        """
+        Generate an image with OpenAI Images API and return PNG bytes.
+        Uses model 'gpt-image-1' and returns the first image.
+        """
+        key = await self.config.openai_key()
+        if not key:
+            raise RuntimeError("OpenAI API key not set. Use `[p]aprilconfig openaikey <key>`.")
+
+        url = "https://api.openai.com/v1/images/generations"
+        headers = {
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": "gpt-image-1",
+            "prompt": prompt,
+            "size": size,
+        }
+
+        tllogger.debug(f"OpenAI image request for prompt: {prompt[:120]}...")
+        async with self.session.post(url, json=payload, headers=headers, timeout=90) as r:
+            if r.status != 200:
+                try:
+                    err = await r.json()
+                except:
+                    err = {"error": {"message": await r.text()}}
+                message = err.get("error", {}).get("message", f"HTTP {r.status}")
+                raise RuntimeError(f"OpenAI Images API error: {message}")
+
+            data = await r.json()
+            # OpenAI returns base64 PNG under data[0].b64_json
+            b64 = data["data"][0]["b64_json"]
+            return base64.b64decode(b64)
+
+    # Listener for "Draw ..."
+    @commands.Cog.listener("on_message_without_command")
+    async def april_draw_listener(self, message: discord.Message):
+        """
+        If a non-command message starts with 'Draw ', generate an image and post it.
+        Example: Draw a neon fox in the rain
+        """
+        if message.author.bot or not message.content or not message.guild:
+            return
+
+        content = message.content.strip()
+        if not content.lower().startswith("draw "):
+            return
+
+        prompt = content[5:].strip()
+        if not prompt:
+            return
+
+        try:
+            async with message.channel.typing():
+                png_bytes = await self.generate_openai_image_png(prompt, size="1024x1024")
+                file = discord.File(BytesIO(png_bytes), filename="april_draw.png")
+                caption = f"**Prompt:** {prompt}\nRequested by: {message.author.mention}"
+                await message.channel.send(content=caption, file=file)
+        except Exception as e:
+            tllogger.exception("Draw shortcut failed")
+            await message.channel.send(
+                f"⚠️ I couldn't draw that: `{e}`\n"
+                "Set the API key with `[p]aprilconfig openaikey <key>` if needed."
+            )
+
+    # Explicit draw command
+    @commands.command(name="draw")
+    @commands.cooldown(1, 10, commands.BucketType.user)
+    async def draw_command(self, ctx: commands.Context, *, prompt: str):
+        """Generate an image from a prompt. Usage: [p]draw a neon fox in the rain"""
+        try:
+            async with ctx.typing():
+                png_bytes = await self.generate_openai_image_png(prompt, size="1024x1024")
+                file = discord.File(BytesIO(png_bytes), filename="april_draw.png")
+                await ctx.send(content=f"**Prompt:** {prompt}", file=file)
+        except Exception as e:
+            tllogger.exception("Draw command failed")
+            await ctx.send(
+                f"⚠️ I couldn't draw that: `{e}`\n"
+                "Set the API key with `[p]aprilconfig openaikey <key>` if needed."
+            )
+
     @commands.group(name="aprilconfig", aliases=["aprilcfg"])
     @commands.is_owner()
     async def aprilconfig(self, ctx):
@@ -596,6 +684,17 @@ class AprilAI(commands.Cog):
             await ctx.message.delete()
         except:
             pass
+
+    @aprilconfig.command()
+    async def openaikey(self, ctx, key: str):
+        """Set OpenAI API key for image generation."""
+        await self.config.openai_key.set(key)
+        await ctx.tick()
+        try:
+            await ctx.message.delete()
+        except:
+            pass
+
     @commands.command()
     async def play_tts(self, ctx, filename: str):
         """Play a TTS file from the april_tts folder."""
@@ -765,10 +864,12 @@ class AprilAI(commands.Cog):
         deepseek_key = cfg['deepseek_key']
         anthropic_key = cfg['anthropic_key']
         tts_key = cfg['tts_key']
+        openai_key = cfg.get('openai_key', '')
         
         e.add_field(name="DeepSeek Key", value=f"`...{deepseek_key[-4:]}`" if deepseek_key else "❌ Not set", inline=False)
         e.add_field(name="Anthropic Key", value=f"`...{anthropic_key[-4:]}`" if anthropic_key else "❌ Not set", inline=False)
         e.add_field(name="ElevenLabs Key", value=f"`...{tts_key[-4:]}`" if tts_key else "❌ Not set", inline=False)
+        e.add_field(name="OpenAI Key", value=f"`...{openai_key[-4:]}`" if openai_key else "❌ Not set", inline=False)
         e.add_field(name="Voice ID", value=f"`{cfg['voice_id']}`", inline=True)
         e.add_field(name="Model", value=f"`{cfg['model']}`", inline=True)
         e.add_field(name="Temperature", value=f"`{cfg['temperature']}`", inline=True)
@@ -904,7 +1005,7 @@ class AprilAI(commands.Cog):
         
         # Build the payload with proper format for latest Anthropic API
         payload = {
-            "model": "claude-3-5-sonnet-20241022",  # Latest stable Claude model
+            "model": "claude-3-5-sonnet-20241022",  # Latest stable Claude model (update as needed)
             "messages": conversation_messages,
             "max_tokens": await self.config.max_tokens(),
             "temperature": await self.config.temperature()
