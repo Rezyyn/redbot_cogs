@@ -23,6 +23,9 @@ from typing import Optional, List, Dict
 tllogger = logging.getLogger("red.aprilai")
 tllogger.setLevel(logging.DEBUG)
 
+# Default style suffix for images
+STYLE_SUFFIX = ", in a futuristic neo-cyberpunk aesthetic"
+
 # Emotion GIFs repository
 EMOTION_GIFS = {
     "happy": [
@@ -79,14 +82,15 @@ class AprilAI(commands.Cog):
             model="deepseek-chat",
             temperature=0.7,
             max_tokens=2048,
-            system_prompt="You are April, a helpful AI assistant.",
+            system_prompt="You are April, a helpful AI assistant for Discord. "
+                          "Default to useful answers. Be concise and kind.",
             smert_prompt="You are April in 'smert' mode - an incredibly intelligent, witty, and creative AI assistant with deep knowledge across all domains.",
             tts_enabled=True,
             text_response_when_voice=True,
             max_history=5,  # Default 5 exchanges
             use_gifs=True,
             max_message_length=1800,  # For splitting long messages
-            openai_key="",  # <-- for Draw image generation
+            openai_key="",  # for Draw image generation
         )
         
         self.config.register_user(
@@ -112,6 +116,28 @@ class AprilAI(commands.Cog):
             finally:
                 self.tts_files.discard(path)
 
+    # -----------------------
+    # Prompt helpers
+    # -----------------------
+    def style_prompt(self, prompt: str) -> str:
+        """Bias every image to neo-cyberpunk/futuristic unless the user explicitly sets a style."""
+        p = prompt.strip()
+        if any(k in p.lower() for k in ["cyberpunk", "synthwave", "futuristic", "sci-fi", "science fiction", "blade runner"]):
+            return p
+        return p + STYLE_SUFFIX
+
+    def maybe_extract_draw_prompt(self, text: str) -> Optional[str]:
+        """Extracts a single <draw>...</draw> block; returns inner prompt or None."""
+        match = re.search(r"<draw>(.*?)</draw>", text, flags=re.IGNORECASE | re.DOTALL)
+        if not match:
+            return None
+        raw = match.group(1).strip()
+        raw = re.sub(r"\s+", " ", raw).strip()
+        return raw or None
+
+    # -----------------------
+    # Lavalink helpers
+    # -----------------------
     async def detect_emotion(self, text: str) -> Optional[str]:
         """Detect emotion from text for GIF selection"""
         text_lower = text.lower()
@@ -150,7 +176,6 @@ class AprilAI(commands.Cog):
             return False
         
         try:
-            # Check various connection indicators
             if hasattr(player, 'is_connected') and callable(player.is_connected):
                 return player.is_connected()
             elif hasattr(player, 'is_connected'):
@@ -181,24 +206,59 @@ class AprilAI(commands.Cog):
             tllogger.error(f"Error getting player channel ID: {e}")
             return None
 
+    # -----------------------
+    # Commands
+    # -----------------------
     @commands.group(name="april", invoke_without_command=True)
     @commands.cooldown(1, 15, commands.BucketType.user)
     async def april(self, ctx, *, input: str):
         """Main April command"""
-        cmd = input.strip().lower()
-        
-        # Handle special commands
-        if cmd == "join":
+        cmd = input.strip()
+
+        # special trigger (case-insensitive, tolerant)
+        if cmd.lower().startswith("i know what you're thinking"):
+            return await self._draw_what_you_think(ctx)
+
+        # Handle special short text commands
+        low = cmd.lower()
+        if low == "join":
             return await self.join_voice(ctx)
-        if cmd == "leave":
+        if low == "leave":
             return await self.leave_voice(ctx)
-        if cmd == "clearhistory":
+        if low == "clearhistory":
             return await self.clear_history(ctx)
-        if cmd == "smert":
+        if low == "smert":
             return await self.toggle_smert_mode(ctx)
             
         tllogger.debug(f"Command april: {input} by {ctx.author}")
         await self.process_query(ctx, input)
+
+    @april.command(name="draw")
+    @commands.cooldown(1, 10, commands.BucketType.user)
+    async def april_draw(self, ctx: commands.Context, *, prompt: str):
+        """
+        Draw an image with OpenAI (group command).
+        Usage:
+          .april draw a neon fox in the rain
+          .april draw me a neon fox in the rain
+        """
+        p = prompt.strip()
+        if p.lower().startswith("me "):
+            p = p[3:].strip()
+
+        styled_prompt = self.style_prompt(p)
+
+        try:
+            async with ctx.typing():
+                png_bytes = await self.generate_openai_image_png(styled_prompt, size="1024x1024")
+                file = discord.File(BytesIO(png_bytes), filename="april_draw.png")
+                await ctx.send(content=f"**Prompt:** {styled_prompt}", file=file)
+        except Exception as e:
+            tllogger.exception("April group draw failed")
+            await ctx.send(
+                f"⚠️ I couldn't draw that: `{e}`\n"
+                "Set the key with `[p]aprilconfig openaikey <key>` if needed."
+            )
 
     @april.command(name="smert")
     async def toggle_smert_mode(self, ctx):
@@ -207,7 +267,6 @@ class AprilAI(commands.Cog):
         current_mode = await user_config.smert_mode()
         
         if not current_mode:
-            # Check if user has custom key or global key exists
             custom_key = await user_config.custom_anthropic_key()
             global_key = await self.config.anthropic_key()
             
@@ -231,36 +290,12 @@ class AprilAI(commands.Cog):
         if channel_id in self.history:
             self.history[channel_id].clear()
         await ctx.send("✅ Conversation history cleared for this channel.")
-    @april.command(name="draw")
-    @commands.cooldown(1, 10, commands.BucketType.user)
-    async def april_draw(self, ctx: commands.Context, *, prompt: str):
-        """
-        Draw an image with OpenAI. Usage:
-          .april draw a neon fox in the rain
-          .april draw me a neon fox in the rain
-        """
-        # allow "draw me ..." or just "draw ..."
-        p = prompt.strip()
-        if p.lower().startswith("me "):
-            p = p[3:].strip()
-    
-        try:
-            async with ctx.typing():
-                png_bytes = await self.generate_openai_image_png(p, size="1024x1024")
-                file = discord.File(BytesIO(png_bytes), filename="april_draw.png")
-                await ctx.send(content=f"**Prompt:** {p}", file=file)
-        except Exception as e:
-            tllogger.exception("April group draw failed")
-            await ctx.send(
-                f"⚠️ I couldn't draw that: `{e}`\n"
-                "Set the key with `[p]aprilconfig openaikey <key>` if needed."
-            )        
+
     @april.command(name="join")
     async def join_voice(self, ctx):
         """Join voice channel"""
         tllogger.info(f"[AprilAI] join_voice invoked by {ctx.author}")
         
-        # Check if user is in voice
         if not ctx.author.voice or not ctx.author.voice.channel:
             return await ctx.send("❌ You must be in a voice channel.")
         
@@ -270,11 +305,9 @@ class AprilAI(commands.Cog):
             return await ctx.send("❌ I need permissions to connect and speak!")
         
         try:
-            # Check if lavalink is available
             if not hasattr(lavalink, 'get_player'):
                 return await ctx.send("❌ Lavalink is not initialized. Please load the Audio cog first with `[p]load audio`")
             
-            # Try to get existing player first
             player = self.get_player(ctx.guild.id)
             
             if player and self.is_player_connected(player):
@@ -282,10 +315,8 @@ class AprilAI(commands.Cog):
                 if current_channel_id == channel.id:
                     return await ctx.send(f"✅ Already connected to {channel.name}")
                 else:
-                    # Disconnect from current channel
                     await player.disconnect()
             
-            # Connect to new channel
             await lavalink.connect(channel)
             player = self.get_player(ctx.guild.id)
             
@@ -313,8 +344,11 @@ class AprilAI(commands.Cog):
             tllogger.error(f"Disconnect failed: {e}")
             await ctx.send(f"❌ Disconnect failed: {e}")
 
+    # -----------------------
+    # Core flow
+    # -----------------------
     async def process_query(self, ctx, input_text):
-        # Check if we should use voice
+        # Should we use voice?
         use_voice = False
         if await self.config.tts_enabled():
             try:
@@ -324,13 +358,12 @@ class AprilAI(commands.Cog):
             except:
                 use_voice = False
         
-        # Check if user is in smert mode
+        # Smert mode?
         user_config = self.config.user(ctx.author)
         smert_mode = await user_config.smert_mode()
         
         tllogger.debug(f"process_query use_voice={use_voice}, smert_mode={smert_mode}")
         
-        # Start typing indicator
         async with ctx.typing():
             try:
                 # Get or create history for this channel
@@ -356,22 +389,37 @@ class AprilAI(commands.Cog):
                 else:
                     resp = await self.query_deepseek(ctx.author.id, messages)
                 
-                # Update history with new exchange
+                # Detect <draw>...</draw> and remove it from the displayed text
+                draw_prompt = self.maybe_extract_draw_prompt(resp)
+                clean_resp = re.sub(r"<draw>.*?</draw>", "", resp, flags=re.IGNORECASE | re.DOTALL).strip()
+
+                # Update history with the clean text
                 self.history[channel_id].append({"role": "user", "content": input_text})
-                self.history[channel_id].append({"role": "assistant", "content": resp})
+                self.history[channel_id].append({"role": "assistant", "content": clean_resp})
                 
-                # Start both text and voice simultaneously for natural conversation feel
                 tasks = []
-                
-                # Always send text response (unless specifically disabled for voice)
+
+                # Send text response (unless you mute it when voice-only)
                 if not (use_voice and not await self.config.text_response_when_voice()):
-                    tasks.append(asyncio.create_task(self.send_streamed_response(ctx, resp)))
+                    tasks.append(asyncio.create_task(self.send_streamed_response(ctx, clean_resp)))
                 
-                # Send voice response if enabled and connected
+                # Voice TTS if connected
                 if use_voice:
-                    tasks.append(asyncio.create_task(self.speak_response(ctx, resp)))
+                    tasks.append(asyncio.create_task(self.speak_response(ctx, clean_resp)))
+
+                # If April suggested a draw, render image inline
+                if draw_prompt:
+                    styled = self.style_prompt(draw_prompt)
+                    async def _draw_and_send():
+                        try:
+                            png = await self.generate_openai_image_png(styled, size="1024x1024")
+                            file = discord.File(BytesIO(png), filename="april_draw.png")
+                            await ctx.send(content=f"**Inline image suggestion:** {styled}", file=file)
+                        except Exception as e:
+                            tllogger.exception("Inline draw failed")
+                            await ctx.send(f"⚠️ Couldn't render the suggested image: `{e}`")
+                    tasks.append(asyncio.create_task(_draw_and_send()))
                 
-                # Wait for both to complete
                 if tasks:
                     await asyncio.gather(*tasks, return_exceptions=True)
                     
@@ -387,19 +435,17 @@ class AprilAI(commands.Cog):
         # Detect emotion and potentially add GIF
         emotion = await self.detect_emotion(resp) if use_gifs else None
         gif_url = None
-        if emotion and random.random() < 0.3:  # 30% chance to include GIF
+        if emotion and random.random() < 0.3:
             gif_url = random.choice(EMOTION_GIFS[emotion])
         
         # Split long messages
         if len(resp) > max_length:
-            # Create initial "thinking" message
             embed = discord.Embed(
                 description="💭 *Thinking...*",
                 color=await ctx.embed_color()
             )
             thinking_msg = await ctx.send(embed=embed)
             
-            # Split response into chunks
             chunks = []
             words = resp.split(' ')
             current_chunk = []
@@ -417,29 +463,25 @@ class AprilAI(commands.Cog):
             if current_chunk:
                 chunks.append(' '.join(current_chunk))
             
-            # Send first chunk by editing thinking message
             first_chunk = chunks[0]
             if gif_url and len(chunks) == 1:
                 await thinking_msg.edit(content=first_chunk + f"\n{gif_url}", embed=None)
             else:
                 await thinking_msg.edit(content=first_chunk, embed=None)
             
-            # Send remaining chunks
             for i, chunk in enumerate(chunks[1:], 1):
-                await asyncio.sleep(0.5)  # Small delay between messages
+                await asyncio.sleep(0.5)
                 if gif_url and i == len(chunks) - 1:
                     await ctx.send(chunk + f"\n{gif_url}")
                 else:
                     await ctx.send(chunk)
         else:
-            # Single message with streaming effect
             embed = discord.Embed(
                 description="💭 *Thinking...*",
                 color=await ctx.embed_color()
             )
             msg = await ctx.send(embed=embed)
             
-            # Simulate streaming by updating message in chunks
             chunk_size = 50
             for i in range(0, len(resp), chunk_size):
                 chunk = resp[:i + chunk_size]
@@ -447,9 +489,8 @@ class AprilAI(commands.Cog):
                     await msg.edit(content=chunk + f"\n{gif_url}", embed=None)
                 else:
                     await msg.edit(content=chunk + "▌", embed=None)
-                await asyncio.sleep(0.05)  # Small delay for streaming effect
+                await asyncio.sleep(0.05)
             
-            # Final message without cursor
             if gif_url:
                 await msg.edit(content=resp + f"\n{gif_url}", embed=None)
             else:
@@ -463,13 +504,11 @@ class AprilAI(commands.Cog):
             return
 
         try:
-            # Verify voice connection
             player = self.get_player(ctx.guild.id)
             if not self.is_player_connected(player):
                 tllogger.warning("Skipping TTS: Player not connected.")
                 return
 
-            # Clean and generate TTS
             clean_text = self.clean_text_for_tts(text)
             if not clean_text.strip():
                 return
@@ -479,7 +518,6 @@ class AprilAI(commands.Cog):
                 tllogger.error("Failed to generate TTS audio")
                 return
 
-            # Prepare path in Red's required localtracks folder
             localtrack_dir = cog_data_path(self).parent / "Audio" / "localtracks" / "april_tts"
             localtrack_dir.mkdir(parents=True, exist_ok=True)
 
@@ -491,7 +529,6 @@ class AprilAI(commands.Cog):
 
             tllogger.debug(f"TTS audio saved: {filepath}")
 
-            # Play using the Audio cog directly
             audio_cog = self.bot.get_cog("Audio")
             if audio_cog:
                 play_command = audio_cog.command_play
@@ -500,9 +537,8 @@ class AprilAI(commands.Cog):
                 tllogger.error("Audio cog not found")
                 return
 
-            # Delay then delete file
             async def delayed_delete():
-                await asyncio.sleep(30)  # Reduced to 30 seconds for faster cleanup
+                await asyncio.sleep(30)
                 try:
                     if filepath.exists():
                         filepath.unlink()
@@ -532,24 +568,19 @@ class AprilAI(commands.Cog):
 
     def clean_text_for_tts(self, text: str) -> str:
         """Clean text for better TTS output"""
-        # Remove markdown formatting
-        text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)  # **bold**
-        text = re.sub(r'\*(.*?)\*', r'\1', text)      # *italic*
-        text = re.sub(r'`(.*?)`', r'\1', text)        # `code`
-        text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)  # code blocks
-
-        # Remove URLs
+        text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
+        text = re.sub(r'\*(.*?)\*', r'\1', text)
+        text = re.sub(r'`(.*?)`', r'\1', text)
+        text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)
         text = re.sub(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', '', text)
-        
-        # Clean up extra whitespace and newlines
         text = re.sub(r'\s+', ' ', text).strip()
-        
-        # Limit length to avoid API issues
         if len(text) > 1000:
             text = text[:1000].rsplit(' ', 1)[0] + "..."
-
         return text
 
+    # -----------------------
+    # TTS (ElevenLabs)
+    # -----------------------
     async def generate_tts_audio(self, text: str, api_key: str) -> bytes:
         """Generate TTS audio using ElevenLabs API"""
         try:
@@ -619,51 +650,88 @@ class AprilAI(commands.Cog):
                 raise RuntimeError(f"OpenAI Images API error: {message}")
 
             data = await r.json()
-            # OpenAI returns base64 PNG under data[0].b64_json
             b64 = data["data"][0]["b64_json"]
             return base64.b64decode(b64)
 
-    # Listener for "Draw ..."
-    @commands.Cog.listener("on_message_without_command")
-    async def april_draw_listener(self, message: discord.Message):
+    # -----------------------
+    # DeepSeek helpers
+    # -----------------------
+    async def deepseek_image_prompt(self, messages: list) -> str:
         """
-        If a non-command message starts with 'Draw ', generate an image and post it.
-        Example: Draw a neon fox in the rain
+        Ask DeepSeek to produce a single-line image prompt (no commentary).
+        Reuses your existing DeepSeek chat API.
         """
-        if message.author.bot or not message.content or not message.guild:
-            return
-
-        content = message.content.strip()
-        if not content.lower().startswith("draw "):
-            return
-
-        prompt = content[5:].strip()
-        if not prompt:
-            return
-
-        try:
-            async with message.channel.typing():
-                png_bytes = await self.generate_openai_image_png(prompt, size="1024x1024")
-                file = discord.File(BytesIO(png_bytes), filename="april_draw.png")
-                caption = f"**Prompt:** {prompt}\nRequested by: {message.author.mention}"
-                await message.channel.send(content=caption, file=file)
-        except Exception as e:
-            tllogger.exception("Draw shortcut failed")
-            await message.channel.send(
-                f"⚠️ I couldn't draw that: `{e}`\n"
-                "Set the API key with `[p]aprilconfig openaikey <key>` if needed."
+        sys = {
+            "role": "system",
+            "content": (
+                "You write exactly ONE single-line image prompt suitable for a text-to-image model. "
+                "No commentary, no markdown, no quotes. Keep it concise and vivid. "
+                "Default to a futuristic neo-cyberpunk aesthetic unless the user requests otherwise."
             )
+        }
+        crafted = await self.query_deepseek(
+            user_id=0,
+            messages=[sys] + messages[-10:]
+        )
+        crafted = re.sub(r"\s+", " ", crafted).strip()
+        return crafted
 
-    # Explicit draw command
+    # -----------------------
+    # Special flow
+    # -----------------------
+    async def _draw_what_you_think(self, ctx: commands.Context):
+        """
+        Path: DeepSeek chat for reply -> DeepSeek image prompt -> OpenAI image -> post text + image.
+        Uses recent channel history for context.
+        """
+        async with ctx.typing():
+            try:
+                channel_id = ctx.channel.id
+                max_history = await self.config.max_history()
+                if channel_id not in self.history:
+                    self.history[channel_id] = deque(maxlen=max_history * 2)
+
+                system_prompt = await self.config.system_prompt()
+                messages = [{"role": "system", "content": system_prompt}]
+                messages.extend(self.history[channel_id])
+                messages.append({"role": "user", "content": "User: I know what you're thinking, draw me it!"})
+
+                # 1) Chat reply (DeepSeek)
+                chat_resp = await self.query_deepseek(ctx.author.id, messages)
+
+                # 2) DeepSeek crafts a single-line image prompt
+                img_prompt = await self.deepseek_image_prompt(messages + [{"role": "assistant", "content": chat_resp}])
+
+                # 3) OpenAI renders the image
+                styled = self.style_prompt(img_prompt)
+                png = await self.generate_openai_image_png(styled, size="1024x1024")
+
+                # 4) Post both
+                file = discord.File(BytesIO(png), filename="april_draw.png")
+                await ctx.send(content=f"{chat_resp}\n\n**Image:** {styled}", file=file)
+
+                # Update history
+                self.history[channel_id].append({"role": "user", "content": "I know what you're thinking, draw me it!"})
+                self.history[channel_id].append({"role": "assistant", "content": chat_resp + f"\n[Image: {styled}]"})
+
+            except Exception as e:
+                tllogger.exception("draw-what-you-think flow failed")
+                await ctx.send(f"⚠️ Couldn't complete the draw-what-you-think flow: `{e}`")
+
+    # -----------------------
+    # Top-level DRAW command (kept)
+    # -----------------------
     @commands.command(name="draw")
     @commands.cooldown(1, 10, commands.BucketType.user)
     async def draw_command(self, ctx: commands.Context, *, prompt: str):
         """Generate an image from a prompt. Usage: [p]draw a neon fox in the rain"""
+        p = prompt.strip()
+        styled_prompt = self.style_prompt(p)
         try:
             async with ctx.typing():
-                png_bytes = await self.generate_openai_image_png(prompt, size="1024x1024")
+                png_bytes = await self.generate_openai_image_png(styled_prompt, size="1024x1024")
                 file = discord.File(BytesIO(png_bytes), filename="april_draw.png")
-                await ctx.send(content=f"**Prompt:** {prompt}", file=file)
+                await ctx.send(content=f"**Prompt:** {styled_prompt}", file=file)
         except Exception as e:
             tllogger.exception("Draw command failed")
             await ctx.send(
@@ -671,6 +739,9 @@ class AprilAI(commands.Cog):
                 "Set the API key with `[p]aprilconfig openaikey <key>` if needed."
             )
 
+    # -----------------------
+    # Config commands
+    # -----------------------
     @commands.group(name="aprilconfig", aliases=["aprilcfg"])
     @commands.is_owner()
     async def aprilconfig(self, ctx):
@@ -725,8 +796,6 @@ class AprilAI(commands.Cog):
         if not audio_cog:
             await ctx.send("Audio cog not loaded.")
             return
-
-        # Play specific file from april_tts folder
         query = f"april_tts/{filename}"
         await ctx.invoke(audio_cog.play, query=query)
 
@@ -791,7 +860,6 @@ class AprilAI(commands.Cog):
         """Set max conversation history exchanges (1-20)"""
         if 1 <= num <= 20:
             await self.config.max_history.set(num)
-            # Update existing history maxlen
             for channel_id in self.history:
                 self.history[channel_id] = deque(self.history[channel_id], maxlen=num*2)
             await ctx.send(f"✅ Max history set to `{num}` exchanges")
@@ -820,11 +888,8 @@ class AprilAI(commands.Cog):
         embed = discord.Embed(title="AprilAI Debug Information", color=0xff0000)
         
         try:
-            # Check lavalink initialization
             if hasattr(lavalink, 'get_player'):
                 embed.add_field(name="Lavalink Status", value="✅ Initialized", inline=True)
-                
-                # Test getting a player with better error handling
                 try:
                     player = self.get_player(ctx.guild.id)
                     if player is not None:
@@ -856,7 +921,6 @@ class AprilAI(commands.Cog):
         except Exception as e:
             embed.add_field(name="Debug Error", value=f"❌ Error: {e}", inline=False)
         
-        # Test TTS generation
         tts_key = await self.config.tts_key()
         if tts_key:
             embed.add_field(name="ElevenLabs Key", value="✅ Set", inline=True)
@@ -871,7 +935,6 @@ class AprilAI(commands.Cog):
         else:
             embed.add_field(name="ElevenLabs Key", value="❌ Not set", inline=True)
         
-        # Add guild info for debugging
         embed.add_field(name="Guild ID", value=f"`{ctx.guild.id}`", inline=True)
         embed.add_field(name="Bot Voice State", value="✅ Connected" if ctx.guild.voice_client else "❌ Not connected", inline=True)
         
@@ -883,7 +946,6 @@ class AprilAI(commands.Cog):
         cfg = await self.config.all()
         e = discord.Embed(title="AprilAI Configuration", color=await ctx.embed_color())
         
-        # Security: show partial keys
         deepseek_key = cfg['deepseek_key']
         anthropic_key = cfg['anthropic_key']
         tts_key = cfg['tts_key']
@@ -911,55 +973,9 @@ class AprilAI(commands.Cog):
         
         await ctx.send(embed=e)
 
-    @commands.group(name="apriluser")
-    async def apriluser(self, ctx):
-        """User-specific AprilAI settings"""
-        if ctx.invoked_subcommand is None:
-            await self.show_user_settings(ctx)
-
-    @apriluser.command(name="setkey")
-    async def set_user_key(self, ctx, key: str):
-        """Set your personal Anthropic API key for smert mode"""
-        await self.config.user(ctx.author).custom_anthropic_key.set(key)
-        await ctx.tick()
-        try:
-            await ctx.message.delete()
-        except:
-            pass
-
-    @apriluser.command(name="setprompt")
-    async def set_user_prompt(self, ctx, *, prompt: str):
-        """Set your personal smert mode prompt"""
-        await self.config.user(ctx.author).custom_smert_prompt.set(prompt)
-        await ctx.send("✅ Your personal smert prompt has been set")
-
-    @apriluser.command(name="settings")
-    async def show_user_settings(self, ctx):
-        """Show your personal settings"""
-        user_cfg = await self.config.user(ctx.author).all()
-        
-        e = discord.Embed(
-            title=f"AprilAI Settings for {ctx.author.display_name}",
-            color=await ctx.embed_color()
-        )
-        
-        e.add_field(name="Smert Mode", value="✅ Active" if user_cfg['smert_mode'] else "❌ Inactive", inline=True)
-        
-        custom_key = user_cfg['custom_anthropic_key']
-        e.add_field(
-            name="Personal Anthropic Key", 
-            value=f"`...{custom_key[-4:]}`" if custom_key else "❌ Not set", 
-            inline=True
-        )
-        
-        if user_cfg['custom_smert_prompt']:
-            prompt_preview = user_cfg['custom_smert_prompt'][:200] + ("..." if len(user_cfg['custom_smert_prompt']) > 200 else "")
-            e.add_field(name="Personal Smert Prompt", value=f"```{prompt_preview}```", inline=False)
-        else:
-            e.add_field(name="Personal Smert Prompt", value="Using default smert prompt", inline=False)
-        
-        await ctx.send(embed=e)
-
+    # -----------------------
+    # DeepSeek / Anthropic
+    # -----------------------
     async def query_deepseek(self, user_id: int, messages: list):
         """Query DeepSeek API"""
         key = await self.config.deepseek_key()
@@ -980,7 +996,7 @@ class AprilAI(commands.Cog):
                 "https://api.deepseek.com/v1/chat/completions", 
                 json=payload,
                 headers=headers, 
-                timeout=60  # Increased timeout for large responses
+                timeout=60
             ) as r:
                 if r.status != 200:
                     error_data = await r.json()
@@ -996,7 +1012,6 @@ class AprilAI(commands.Cog):
 
     async def query_anthropic(self, user_id: int, messages: list):
         """Query Anthropic Claude API for smert mode"""
-        # Check for user's custom key first
         user = self.bot.get_user(user_id)
         if user:
             custom_key = await self.config.user(user).custom_anthropic_key()
@@ -1016,25 +1031,20 @@ class AprilAI(commands.Cog):
             "Content-Type": "application/json"
         }
         
-        # Extract system message and user/assistant messages
         system_content = None
         conversation_messages = []
-        
         for msg in messages:
             if msg["role"] == "system":
                 system_content = msg["content"]
             else:
                 conversation_messages.append(msg)
         
-        # Build the payload with proper format for latest Anthropic API
         payload = {
-            "model": "claude-3-5-sonnet-20241022",  # Latest stable Claude model (update as needed)
+            "model": "claude-3-5-sonnet-20241022",
             "messages": conversation_messages,
             "max_tokens": await self.config.max_tokens(),
             "temperature": await self.config.temperature()
         }
-        
-        # Add system prompt if it exists
         if system_content:
             payload["system"] = system_content
         
@@ -1056,6 +1066,9 @@ class AprilAI(commands.Cog):
         except Exception as e:
             raise Exception(f"API Error: {str(e)}")
 
+    # -----------------------
+    # Voice events
+    # -----------------------
     @commands.Cog.listener()
     async def on_voice_state_update(self, member, before, after):
         """Handle voice state updates"""
@@ -1065,7 +1078,6 @@ class AprilAI(commands.Cog):
         try:
             player = self.get_player(member.guild.id)
             if player and self.is_player_connected(player):
-                # Check if only bot remains in voice
                 channel_id = self.get_player_channel_id(player)
                 if channel_id:
                     voice_channel = self.bot.get_channel(channel_id)
