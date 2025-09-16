@@ -414,7 +414,7 @@ class AprilAI(commands.Cog):
                         try:
                             png = await self.generate_openai_image_png(styled, size="1024x1024")
                             file = discord.File(BytesIO(png), filename="april_draw.png")
-                            await ctx.send(content=f"**Inline image suggestion:** {styled}", file=file)
+                            await ctx.send(content=f"pic related:", file=file)
                         except Exception as e:
                             tllogger.exception("Inline draw failed")
                             await ctx.send(f"⚠️ Couldn't render the suggested image: `{e}`")
