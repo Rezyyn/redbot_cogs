@@ -227,13 +227,59 @@ class AprilTalk(commands.Cog):
             return str(uid), (user.name if user else None)
         return None, mention.lstrip("@")
 
-    def _build_logql_for_user(self, *, guild_id: int, channel_id: int, user_id: Optional[str], user_name: Optional[str]) -> str:
-        base = f'{{app="discord-bot",event_type="message",guild_id="{guild_id}",channel_id="{channel_id}"}} | json'
-        if user_id:
-            return base + f' | author.id="{user_id}"'
-        if user_name:
-            return base + f' | author.name="{user_name}"'
-        return base
+def _logql_quote(self, s: str) -> str:
+    """
+    Safely quote a value for LogQL equality matches.
+    Escapes backslashes and double quotes.
+    """
+    if s is None:
+        return ""
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _build_logql_for_user(
+    self,
+    *,
+    guild_id: int,
+    channel_id: int,
+    user_id: Optional[str],
+    user_name: Optional[str],
+) -> str:
+    """
+    Build a LogQL query that:
+      1) selects the right stream (labels),
+      2) parses JSON,
+      3) LIFTS nested JSON fields into labels via `label_format`,
+      4) filters on those lifted labels.
+
+    This avoids `unexpected .` parser errors from dotted paths like `author.id`.
+    """
+    # 1 + 2) select stream & parse JSON
+    base = (
+        f'{{app="discord-bot",event_type="message",guild_id="{guild_id}",channel_id="{channel_id}"}} '
+        f'| json'
+    )
+
+    # 3) Lift nested fields to labels, then 4) filter on them
+    if user_id:
+        uid = self._logql_quote(user_id)
+        # author.id -> author_id
+        return (
+            base
+            + ' | label_format author_id="{{.author.id}}"'
+            + f' | author_id="{uid}"'
+        )
+
+    if user_name:
+        uname = self._logql_quote(user_name)
+        # author.name -> author_name
+        return (
+            base
+            + ' | label_format author_name="{{.author.name}}"'
+            + f' | author_name="{uname}"'
+        )
+
+    return base
 
     async def _loki_query_range(self, query: str, start_ns: int, end_ns: int, limit: int = 50):
         cfg = await self.config.all()
