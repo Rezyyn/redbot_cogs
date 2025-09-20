@@ -22,8 +22,8 @@ from redbot.core.utils.chat_formatting import pagify
 # -----------------------------------
 # Logger
 # -----------------------------------
-tllogger = logging.getLogger("red.apriltalk")
-tllogger.setLevel(logging.DEBUG)
+log = logging.getLogger("red.apriltalk")
+log.setLevel(logging.DEBUG)
 
 STYLE_SUFFIX = ", in a futuristic neo-cyberpunk aesthetic"
 
@@ -31,62 +31,62 @@ EMOTION_GIFS = {
     "happy": [
         "https://media.giphy.com/media/XbxZ41fWLeRECPsGIJ/giphy.gif",
         "https://media.giphy.com/media/l0HlMG1EX2H38cZeE/giphy.gif",
-        "https://media.giphy.com/media/3o7abKhOpu0NwenH3O/giphy.gif"
+        "https://media.giphy.com/media/3o7abKhOpu0NwenH3O/giphy.gif",
     ],
     "thinking": [
         "https://media.giphy.com/media/d3mlE7uhX8KFgEmY/giphy.gif",
         "https://media.giphy.com/media/3o7btPCcdNniyf0ArS/giphy.gif",
-        "https://media.giphy.com/media/l0HlUNj5BRuYDLxFm/giphy.gif"
+        "https://media.giphy.com/media/l0HlUNj5BRuYDLxFm/giphy.gif",
     ],
     "confused": [
         "https://media.giphy.com/media/3o7btPCcdNniyf0ArS/giphy.gif",
         "https://media.giphy.com/media/xT0xeJpnrWC4XWblEk/giphy.gif",
-        "https://media.giphy.com/media/3oEjI5VtIhHvK37WYo/giphy.gif"
+        "https://media.giphy.com/media/3oEjI5VtIhHvK37WYo/giphy.gif",
     ],
     "excited": [
         "https://media.giphy.com/media/5GoVLqeAOo6PK/giphy.gif",
         "https://media.giphy.com/media/l0HlMURBbyUqF0XQI/giphy.gif",
-        "https://media.giphy.com/media/3rgXBOmTlzyFCURutG/giphy.gif"
+        "https://media.giphy.com/media/3rgXBOmTlzyFCURutG/giphy.gif",
     ],
     "sad": [
         "https://media.giphy.com/media/OPU6wzx8JrHna/giphy.gif",
         "https://media.giphy.com/media/l1AsyjZ8XLd1V7pUk/giphy.gif",
-        "https://media.giphy.com/media/3o7TKSjRrfIPjeiVyM/giphy.gif"
-    ]
+        "https://media.giphy.com/media/3o7TKSjRrfIPjeiVyM/giphy.gif",
+    ],
 }
 
-# -----------------------------------
-# Cog
-# -----------------------------------
+
 class AprilTalk(commands.Cog):
-    """April: chat + voice + Loki recall (standalone; keeps your april_log untouched)"""
+    """April: chat + voice + Loki recall (keeps your logging cog separate)"""
 
     def __init__(self, bot: Red):
         self.bot = bot
-        self.config = Config.get_conf(self, identifier=1398462)  # unique ID
+        # IMPORTANT: keep same identifier so your existing settings persist
+        self.config = Config.get_conf(self, identifier=1398462)
+
         self.session = aiohttp.ClientSession()
 
-        # per-channel conversation (deque of dicts)
-        self.history = {}
-        # per-channel recall cache {channel_id: {username: [lines ...]}}
-        self.recall = {}
-        # TTS temp files (if needed)
-        self.tts_files = set()
+        # per-channel conversation
+        self.history: dict[int, deque] = {}
+        # per-channel recall memory {channel_id: {username: [lines...]}}
+        self.recall: dict[int, dict[str, list[str]]] = {}
 
-        # Perf tunables
-        self._api_sem = asyncio.Semaphore(3)   # limit concurrent external calls
-        self._tts_sem = asyncio.Semaphore(1)   # serialize TTS synthesis
-        self._edit_delay = 0.025               # stream edit delay
-        self._chunk_size = 160                 # stream chunk chars
+        # perf tunables
+        self._api_sem = asyncio.Semaphore(3)   # cap concurrent external calls
+        self._tts_sem = asyncio.Semaphore(1)   # serialize TTS
+        self._edit_delay = 0.025               # reduce Discord edit spam
+        self._chunk_size = 160                 # streamed edit chunk size
 
-        # Files
+        # files
         self.tts_dir = Path(cog_data_path(self)) / "tts"
         self.tts_dir.mkdir(exist_ok=True, parents=True)
+        self.tts_files = set()
 
-        # Config
+        # defaults
         self.config.register_global(
             deepseek_key="",
             anthropic_key="",
+            openai_key="",
             tts_key="",
             voice_id="21m00Tcm4TlvDq8ikWAM",
             model="deepseek-chat",
@@ -99,11 +99,10 @@ class AprilTalk(commands.Cog):
             max_history=5,
             use_gifs=True,
             max_message_length=1800,
-            openai_key="",
-            # Loki (works with either base or push URL)
+            # Loki (accepts base or push URL)
             loki_url="http://localhost:3100",
             loki_token="",
-            # Sleep mode - default to your ID
+            # Sleep mode (default allow: you)
             sleep_enabled=False,
             sleep_user_id="165548483128983552",
         )
@@ -111,7 +110,7 @@ class AprilTalk(commands.Cog):
         self.config.register_user(
             smert_mode=False,
             custom_anthropic_key="",
-            custom_smert_prompt=""
+            custom_smert_prompt="",
         )
 
     # -----------------------------------
@@ -132,7 +131,7 @@ class AprilTalk(commands.Cog):
                 self.tts_files.discard(p)
 
     # -----------------------------------
-    # Internal helpers
+    # Helpers
     # -----------------------------------
     async def _with_limit(self, sem: asyncio.Semaphore, coro):
         async with sem:
@@ -198,12 +197,63 @@ class AprilTalk(commands.Cog):
             allowed_int = int(allowed) if allowed else None
         except Exception:
             allowed_int = None
+        # owner can always manage
         try:
             if await self.bot.is_owner(ctx.author):
                 return True
         except Exception:
             pass
         return allowed_int is not None and ctx.author.id == allowed_int
+
+    # Loki normalization etc.
+    def _normalize_loki_base(self, configured_url: str) -> str:
+        raw = (configured_url or "").rstrip("/")
+        if raw.endswith("/loki/api/v1/push"):
+            return raw[: -len("/loki/api/v1/push")]
+        return raw
+
+    def _since_to_ns(self, since: str) -> int:
+        m = re.fullmatch(r"(\d+)([hd])", since or "24h")
+        n = int(m.group(1)) if m else 24
+        unit = m.group(2) if m else "h"
+        sec = n * 3600 if unit == "h" else n * 86400
+        return (int(time.time()) - sec) * 1_000_000_000
+
+    def _mention_to_user(self, mention: str):
+        m = re.fullmatch(r"<@!?(\d+)>", mention.strip())
+        if m:
+            uid = int(m.group(1))
+            user = self.bot.get_user(uid)
+            return str(uid), (user.name if user else None)
+        return None, mention.lstrip("@")
+
+    def _build_logql_for_user(self, *, guild_id: int, channel_id: int, user_id: Optional[str], user_name: Optional[str]) -> str:
+        base = f'{{app="discord-bot",event_type="message",guild_id="{guild_id}",channel_id="{channel_id}"}} | json'
+        if user_id:
+            return base + f' | author.id="{user_id}"'
+        if user_name:
+            return base + f' | author.name="{user_name}"'
+        return base
+
+    async def _loki_query_range(self, query: str, start_ns: int, end_ns: int, limit: int = 50):
+        cfg = await self.config.all()
+        base = self._normalize_loki_base(cfg.get("loki_url", ""))
+        url = f"{base}/loki/api/v1/query_range"
+        headers = {}
+        if cfg.get("loki_token"):
+            headers["Authorization"] = f"Bearer {cfg['loki_token']}"
+        params = {
+            "query": query,
+            "start": str(start_ns),
+            "end": str(end_ns),
+            "limit": str(limit),
+            "direction": "backward",
+        }
+        async with self.session.get(url, params=params, headers=headers, timeout=20) as r:
+            if r.status != 200:
+                body = await r.text()
+                raise RuntimeError(f"Loki {r.status} at {url}: {body}")
+            return await r.json()
 
     # -----------------------------------
     # Commands
@@ -214,20 +264,19 @@ class AprilTalk(commands.Cog):
         """Main April command (chat)"""
         if not await self._is_allowed_to_interact(ctx):
             return
-        cmd = input.strip()
-        if cmd.lower().startswith("i know what you're thinking"):
+        cmd = input.strip().lower()
+        if cmd.startswith("i know what you're thinking"):
             return await self._draw_what_you_think(ctx)
-        if cmd.lower() == "join":
+        if cmd == "join":
             return await self.join_voice(ctx)
-        if cmd.lower() == "leave":
+        if cmd == "leave":
             return await self.leave_voice(ctx)
-        if cmd.lower() == "clearhistory":
+        if cmd == "clearhistory":
             return await self.clear_history(ctx)
-        if cmd.lower() == "smert":
+        if cmd == "smert":
             return await self.toggle_smert_mode(ctx)
         await self.process_query(ctx, input)
 
-    # ---- quick image command within group
     @april.command(name="draw")
     @commands.cooldown(1, 10, commands.BucketType.user)
     async def april_draw(self, ctx: commands.Context, *, prompt: str):
@@ -244,7 +293,7 @@ class AprilTalk(commands.Cog):
         except Exception as e:
             await ctx.send(f"⚠️ I couldn't draw that: `{e}`")
 
-    # ---- sleep controls
+    # Sleep controls (owner)
     @april.command(name="sleep")
     @commands.is_owner()
     async def april_sleep(self, ctx: commands.Context, enabled: bool):
@@ -259,25 +308,22 @@ class AprilTalk(commands.Cog):
         await self.config.sleep_user_id.set(str(uid))
         await ctx.send(f"🔒 Allowed user set to <@{uid}>.")
 
-    # ---- Loki setup helpers
+    # Loki config (owner) – also mirrored under .aprilcfg
     @april.command(name="lokiurl")
     @commands.is_owner()
     async def lokiurl_cmd(self, ctx: commands.Context, url: str):
-        """Set Loki base or push URL (both accepted)."""
-        await self.config.loki_url.set(url)
-        await ctx.tick()
+        await self.config.loki_url.set(url.rstrip("/"))
+        await ctx.send(f"✅ Loki URL set to `{url}`")
 
     @april.command(name="lokitoken")
     @commands.is_owner()
     async def lokitoken_cmd(self, ctx: commands.Context, token: str):
-        """Optional bearer token."""
         await self.config.loki_token.set(token)
-        await ctx.tick()
+        await ctx.send("✅ Loki token set")
 
     @april.command(name="lokiverify")
     @commands.is_owner()
     async def lokiverify_cmd(self, ctx: commands.Context):
-        """Check Loki endpoints resolve + respond."""
         cfg = await self.config.all()
         base = self._normalize_loki_base(cfg.get("loki_url", ""))
         headers = {}
@@ -301,7 +347,6 @@ class AprilTalk(commands.Cog):
 
     @april.command(name="lokitest")
     async def lokitest_cmd(self, ctx: commands.Context):
-        """Quick smoke query over last 5m."""
         try:
             end_ns = int(time.time() * 1_000_000_000)
             start_ns = end_ns - 5 * 60 * 1_000_000_000
@@ -311,14 +356,10 @@ class AprilTalk(commands.Cog):
         except Exception as e:
             await ctx.send(f"❌ lokitest failed: `{e}`")
 
-    # ---- Loki fetch + recall
     @april.command(name="fetch")
     @commands.guild_only()
     async def april_fetch(self, ctx: commands.Context, user_mention: str, since: Optional[str] = "24h", limit: Optional[int] = 20):
-        """Fetch recent messages for @user from Loki and cache as recall memory.
-        Usage: .april fetch @user [since] [limit]
-        since: 1h, 6h, 24h, 7d  /  limit: 1..200
-        """
+        """Fetch recent messages for @user from Loki and cache as recall memory."""
         if not await self._is_allowed_to_interact(ctx):
             return
         if not ctx.guild:
@@ -326,7 +367,7 @@ class AprilTalk(commands.Cog):
 
         uid, uname = self._mention_to_user(user_mention)
         if not uid and not uname:
-            return await ctx.send("❌ I need an @mention or username.")
+            return await ctx.send("❌ I need an @mention or a username.")
 
         limit = max(1, min(int(limit or 20), 200))
         end_ns = int(time.time() * 1_000_000_000)
@@ -359,14 +400,12 @@ class AprilTalk(commands.Cog):
                 for ts, line in rows:
                     content = None
                     author_name = None
-                    # Each line is the JSON payload you wrote
                     try:
                         obj = json.loads(line)
                         content = obj.get("content")
                         author = obj.get("author") or {}
                         author_name = author.get("name")
                     except Exception:
-                        # fallback tiny regex
                         m = re.search(r'"content"\s*:\s*"([^"]*)"', line)
                         content = m.group(1) if m else line
                         m2 = re.search(r'"author"\s*:\s*{[^}]*"name"\s*:\s*"([^"]*)"', line)
@@ -391,7 +430,7 @@ class AprilTalk(commands.Cog):
         except Exception as e:
             await ctx.send(f"⚠️ Loki query failed: `{e}`")
 
-    # ---- Voice helpers
+    # Voice helpers
     @april.command(name="join")
     async def join_voice(self, ctx: commands.Context):
         if not await self._is_allowed_to_interact(ctx):
@@ -453,7 +492,7 @@ class AprilTalk(commands.Cog):
             custom = await user_cfg.custom_anthropic_key()
             globalk = await self.config.anthropic_key()
             if not custom and not globalk:
-                return await ctx.send("❌ Smert mode needs an Anthropic API key. `[p]aprilconfig anthropickey <key>` or `[p]apriluser setkey <key>`")
+                return await ctx.send("❌ Smert mode needs an Anthropic API key. `[p]aprilcfg anthropickey <key>` or `[p]apriluser setkey <key>`")
             await user_cfg.smert_mode.set(True)
             await ctx.send("🧠 Smert mode ON.")
         else:
@@ -461,7 +500,7 @@ class AprilTalk(commands.Cog):
             await ctx.send("💡 Smert mode OFF.")
 
     # -----------------------------------
-    # Core chat flow
+    # Chat flow
     # -----------------------------------
     async def process_query(self, ctx: commands.Context, input_text: str):
         use_voice = False
@@ -483,20 +522,19 @@ class AprilTalk(commands.Cog):
                     self.history[ch] = deque(maxlen=max_hist * 2)
 
                 system_prompt = (await self.config.smert_prompt()) if smert_mode else (await self.config.system_prompt())
-
                 messages = [{"role": "system", "content": system_prompt}]
 
-                # Inject recall memory
+                # inject recall
                 ch_recall = self.recall.get(ch, {})
                 if ch_recall:
-                    chunks = []
+                    mems = []
                     for uname, lines in ch_recall.items():
                         if not lines:
                             continue
                         subset = lines[:5]
-                        chunks.append(f"{uname} recent: " + " | ".join(subset))
-                    if chunks:
-                        messages.append({"role": "system", "content": "[memory] " + " || ".join(chunks)})
+                        mems.append(f"{uname} recent: " + " | ".join(subset))
+                    if mems:
+                        messages.append({"role": "system", "content": "[memory] " + " || ".join(mems)})
 
                 messages.extend(self.history[ch])
                 messages.append({"role": "user", "content": input_text})
@@ -517,6 +555,7 @@ class AprilTalk(commands.Cog):
                     tasks.append(asyncio.create_task(self.send_streamed_response(ctx, clean)))
                 if use_voice:
                     tasks.append(asyncio.create_task(self.speak_response(ctx, clean)))
+
                 if draw_prompt:
                     styled = self.style_prompt(draw_prompt)
 
@@ -573,7 +612,7 @@ class AprilTalk(commands.Cog):
             await msg.edit(content=resp + (f"\n{gif_url}" if gif_url else ""), embed=None)
 
     # -----------------------------------
-    # TTS + images + model backends
+    # TTS / Images / Models
     # -----------------------------------
     def clean_text_for_tts(self, text: str) -> str:
         text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
@@ -622,7 +661,7 @@ class AprilTalk(commands.Cog):
     async def generate_openai_image_png(self, prompt: str, size: str = "1024x1024") -> bytes:
         key = await self.config.openai_key()
         if not key:
-            raise RuntimeError("OpenAI API key not set. Use `[p]aprilconfig openaikey <key>`.")
+            raise RuntimeError("OpenAI API key not set. Use `[p]aprilcfg openaikey <key>`.")
         url = "https://api.openai.com/v1/images/generations"
         headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
         payload = {"model": "gpt-image-1", "prompt": prompt, "size": size}
@@ -640,7 +679,7 @@ class AprilTalk(commands.Cog):
     async def query_deepseek(self, user_id: int, messages: list) -> str:
         key = await self.config.deepseek_key()
         if not key:
-            raise Exception("DeepSeek API key not set. Use `[p]aprilconfig deepseekkey <key>`")
+            raise Exception("DeepSeek API key not set. Use `[p]aprilcfg deepseekkey <key>`")
         headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
         payload = {
             "model": await self.config.model(),
@@ -658,7 +697,6 @@ class AprilTalk(commands.Cog):
 
     async def query_anthropic(self, user_id: int, messages: list) -> str:
         # prefer user key if provided
-        key = None
         user = self.bot.get_user(user_id)
         if user:
             custom = await self.config.user(user).custom_anthropic_key()
@@ -666,7 +704,7 @@ class AprilTalk(commands.Cog):
         else:
             key = await self.config.anthropic_key()
         if not key:
-            raise Exception("Anthropic API key not set. Use `[p]aprilconfig anthropickey <key>` or `[p]apriluser setkey <key>`")
+            raise Exception("Anthropic API key not set. Use `[p]aprilcfg anthropickey <key>` or `[p]apriluser setkey <key>`")
         headers = {"x-api-key": key, "anthropic-version": "2023-06-01", "Content-Type": "application/json"}
         system_content = None
         convo = []
@@ -690,59 +728,7 @@ class AprilTalk(commands.Cog):
             return data["content"][0]["text"].strip()
 
     # -----------------------------------
-    # Loki client (normalize + query)
-    # -----------------------------------
-    def _normalize_loki_base(self, configured_url: str) -> str:
-        raw = (configured_url or "").rstrip("/")
-        if raw.endswith("/loki/api/v1/push"):
-            return raw[: -len("/loki/api/v1/push")]
-        return raw
-
-    def _since_to_ns(self, since: str) -> int:
-        m = re.fullmatch(r"(\d+)([hd])", since or "24h")
-        n = int(m.group(1)) if m else 24
-        unit = m.group(2) if m else "h"
-        sec = n * 3600 if unit == "h" else n * 86400
-        return (int(time.time()) - sec) * 1_000_000_000
-
-    def _mention_to_user(self, mention: str):
-        m = re.fullmatch(r"<@!?(\d+)>", mention.strip())
-        if m:
-            uid = int(m.group(1))
-            user = self.bot.get_user(uid)
-            return str(uid), (user.name if user else None)
-        return None, mention.lstrip("@")
-
-    def _build_logql_for_user(self, *, guild_id: int, channel_id: int, user_id: Optional[str], user_name: Optional[str]) -> str:
-        base = f'{{app="discord-bot",event_type="message",guild_id="{guild_id}",channel_id="{channel_id}"}} | json'
-        if user_id:
-            return base + f' | author.id="{user_id}"'
-        if user_name:
-            return base + f' | author.name="{user_name}"'
-        return base
-
-    async def _loki_query_range(self, query: str, start_ns: int, end_ns: int, limit: int = 50):
-        cfg = await self.config.all()
-        base = self._normalize_loki_base(cfg.get("loki_url", ""))
-        url = f"{base}/loki/api/v1/query_range"
-        headers = {}
-        if cfg.get("loki_token"):
-            headers["Authorization"] = f"Bearer {cfg['loki_token']}"
-        params = {
-            "query": query,
-            "start": str(start_ns),
-            "end": str(end_ns),
-            "limit": str(limit),
-            "direction": "backward",
-        }
-        async with self.session.get(url, params=params, headers=headers, timeout=20) as r:
-            if r.status != 200:
-                body = await r.text()
-                raise RuntimeError(f"Loki {r.status} at {url}: {body}")
-            return await r.json()
-
-    # -----------------------------------
-    # Special flow (fun draw)
+    # Fun flow
     # -----------------------------------
     async def _draw_what_you_think(self, ctx: commands.Context):
         async with ctx.typing():
@@ -756,9 +742,12 @@ class AprilTalk(commands.Cog):
                 messages.extend(self.history[ch])
                 messages.append({"role": "user", "content": "User: I know what you're thinking, draw me it!"})
                 chat_resp = await self._with_limit(self._api_sem, self.query_deepseek(ctx.author.id, messages))
-                img_prompt = await self._with_limit(self._api_sem, self.query_deepseek(0, [
-                    {"role": "system", "content": "You write exactly ONE single-line image prompt; no commentary, no quotes."}
-                ] + messages[-10:] + [{"role": "assistant", "content": chat_resp}]))
+                img_prompt = await self._with_limit(self._api_sem, self.query_deepseek(
+                    0,
+                    [{"role": "system", "content": "You write exactly ONE single-line image prompt; no commentary, no quotes."}]
+                    + messages[-10:]
+                    + [{"role": "assistant", "content": chat_resp}]
+                ))
                 styled = self.style_prompt(img_prompt)
                 png = await self._with_limit(self._api_sem, self.generate_openai_image_png(styled, size="1024x1024"))
                 await ctx.send(file=discord.File(BytesIO(png), filename="april_draw.png"), content=f"{chat_resp}\n\n**Image:** {styled}")
@@ -768,23 +757,147 @@ class AprilTalk(commands.Cog):
                 await ctx.send(f"⚠️ Couldn't complete the draw-what-you-think flow: `{e}`")
 
     # -----------------------------------
-    # Minimal config view (owner can still use your april_log's own commands)
+    # Config group (classic .aprilcfg)
     # -----------------------------------
     @commands.group(name="aprilconfig", aliases=["aprilcfg"])
     @commands.is_owner()
     async def aprilconfig(self, ctx: commands.Context):
+        """Configure April (alias: .aprilcfg)"""
         if ctx.invoked_subcommand is None:
             await self.show_settings(ctx)
+
+    # API keys & model knobs — no reactions, plain confirmation
+    @aprilconfig.command()
+    async def deepseekkey(self, ctx: commands.Context, key: str):
+        await self.config.deepseek_key.set(key)
+        await ctx.send("✅ DeepSeek key set.")
+        try:
+            await ctx.message.delete()
+        except Exception:
+            pass
+
+    @aprilconfig.command()
+    async def anthropickey(self, ctx: commands.Context, key: str):
+        await self.config.anthropic_key.set(key)
+        await ctx.send("✅ Anthropic key set.")
+        try:
+            await ctx.message.delete()
+        except Exception:
+            pass
+
+    @aprilconfig.command()
+    async def elevenlabs(self, ctx: commands.Context, key: str):
+        await self.config.tts_key.set(key)
+        await ctx.send("✅ ElevenLabs key set.")
+        try:
+            await ctx.message.delete()
+        except Exception:
+            pass
+
+    @aprilconfig.command()
+    async def openaikey(self, ctx: commands.Context, key: str):
+        await self.config.openai_key.set(key)
+        await ctx.send("✅ OpenAI key set.")
+        try:
+            await ctx.message.delete()
+        except Exception:
+            pass
+
+    @aprilconfig.command()
+    async def voice(self, ctx: commands.Context, voice_id: str):
+        await self.config.voice_id.set(voice_id)
+        await ctx.send(f"✅ Voice ID set to `{voice_id}`")
+
+    @aprilconfig.command()
+    async def model(self, ctx: commands.Context, model_name: str):
+        await self.config.model.set(model_name.lower())
+        await ctx.send(f"✅ Model set to `{model_name}`")
+
+    @aprilconfig.command()
+    async def temperature(self, ctx: commands.Context, value: float):
+        if 0.0 <= value <= 1.0:
+            await self.config.temperature.set(value)
+            await ctx.send(f"✅ Temperature set to `{value}`")
+        else:
+            await ctx.send("❌ Value must be between 0.0 and 1.0")
+
+    @aprilconfig.command()
+    async def tokens(self, ctx: commands.Context, num: int):
+        if 100 <= num <= 4096:
+            await self.config.max_tokens.set(num)
+            await ctx.send(f"✅ Max tokens set to `{num}`")
+        else:
+            await ctx.send("❌ Value must be between 100 and 4096")
+
+    @aprilconfig.command()
+    async def tts(self, ctx: commands.Context, enabled: bool):
+        await self.config.tts_enabled.set(enabled)
+        await ctx.send(f"✅ TTS {'enabled' if enabled else 'disabled'}")
+
+    @aprilconfig.command()
+    async def textresponse(self, ctx: commands.Context, enabled: bool):
+        await self.config.text_response_when_voice.set(enabled)
+        await ctx.send(f"✅ Text responses will be {'shown' if enabled else 'hidden'} when using voice")
+
+    @aprilconfig.command()
+    async def maxhistory(self, ctx: commands.Context, num: int):
+        if 1 <= num <= 20:
+            await self.config.max_history.set(num)
+            for ch in self.history:
+                self.history[ch] = deque(self.history[ch], maxlen=num * 2)
+            await ctx.send(f"✅ Max history set to `{num}` exchanges")
+        else:
+            await ctx.send("❌ Value must be between 1 and 20")
+
+    @aprilconfig.command()
+    async def gifs(self, ctx: commands.Context, enabled: bool):
+        await self.config.use_gifs.set(enabled)
+        await ctx.send(f"✅ Emotion GIFs {'enabled' if enabled else 'disabled'}")
+
+    @aprilconfig.command()
+    async def messagelength(self, ctx: commands.Context, length: int):
+        if 500 <= length <= 2000:
+            await self.config.max_message_length.set(length)
+            await ctx.send(f"✅ Max message length set to `{length}`")
+        else:
+            await ctx.send("❌ Value must be between 500 and 2000")
+
+    # Loki in .aprilcfg as well
+    @aprilconfig.command(name="lokiurl")
+    async def cfg_lokiurl(self, ctx: commands.Context, url: str):
+        await self.config.loki_url.set(url.rstrip("/"))
+        await ctx.send(f"✅ Loki URL set to `{url}`")
+
+    @aprilconfig.command(name="lokitoken")
+    async def cfg_lokitoken(self, ctx: commands.Context, token: str):
+        await self.config.loki_token.set(token)
+        await ctx.send("✅ Loki token set")
+
+    @aprilconfig.command(name="lokiverify")
+    async def cfg_lokiverify(self, ctx: commands.Context):
+        await self.lokiverify_cmd(ctx)
+
+    # Sleep in .aprilcfg
+    @aprilconfig.command(name="sleep")
+    async def cfg_sleep(self, ctx: commands.Context, enabled: bool):
+        await self.config.sleep_enabled.set(bool(enabled))
+        await ctx.send(f"✅ Sleep mode {'ON' if enabled else 'OFF'}.")
+
+    @aprilconfig.command(name="sleepuser")
+    async def cfg_sleepuser(self, ctx: commands.Context, user_id: Optional[int] = None):
+        uid = user_id or ctx.author.id
+        await self.config.sleep_user_id.set(str(uid))
+        await ctx.send(f"🔒 Allowed user set to <@{uid}>.")
 
     @aprilconfig.command(name="settings")
     async def show_settings(self, ctx: commands.Context):
         cfg = await self.config.all()
         e = discord.Embed(title="AprilTalk Configuration")
         def tail(v): return f"`...{v[-4:]}`" if v else "❌ Not set"
-        e.add_field(name="DeepSeek Key", value=tail(cfg.get("deepseek_key")), inline=False)
-        e.add_field(name="Anthropic Key", value=tail(cfg.get("anthropic_key")), inline=False)
-        e.add_field(name="ElevenLabs Key", value=tail(cfg.get("tts_key")), inline=False)
-        e.add_field(name="OpenAI Key", value=tail(cfg.get("openai_key")), inline=False)
+        e.add_field(name="DeepSeek Key", value=tail(cfg.get("deepseek_key")), inline=True)
+        e.add_field(name="Anthropic Key", value=tail(cfg.get("anthropic_key")), inline=True)
+        e.add_field(name="OpenAI Key", value=tail(cfg.get("openai_key")), inline=True)
+        e.add_field(name="ElevenLabs Key", value=tail(cfg.get("tts_key")), inline=True)
         e.add_field(name="Voice ID", value=f"`{cfg['voice_id']}`", inline=True)
         e.add_field(name="Model", value=f"`{cfg['model']}`", inline=True)
         e.add_field(name="Temperature", value=f"`{cfg['temperature']}`", inline=True)
@@ -803,8 +916,6 @@ class AprilTalk(commands.Cog):
         e.add_field(name="Smert Prompt", value=f"```{sm}```", inline=False)
         await ctx.send(embed=e)
 
-# -----------------------------------
-# Setup
-# -----------------------------------
+
 async def setup(bot: Red):
     await bot.add_cog(AprilTalk(bot))
