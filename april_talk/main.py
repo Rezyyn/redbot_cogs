@@ -63,7 +63,7 @@ class AprilTalk(commands.Cog):
 
     def __init__(self, bot: Red):
         self.bot = bot
-        self.config = Config.get_conf(self, identifier=813984652)  # unique ID
+        self.config = Config.get_conf(self, identifier=1398462)  # unique ID
         self.session = aiohttp.ClientSession()
 
         # per-channel conversation (deque of dicts)
