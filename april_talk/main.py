@@ -12,7 +12,7 @@ import json
 from collections import deque
 from pathlib import Path
 from io import BytesIO
-from typing import Optional
+from typing import Optional, Tuple, Dict, List
 
 from redbot.core import commands, Config
 from redbot.core.bot import Red
@@ -25,7 +25,11 @@ from redbot.core.utils.chat_formatting import pagify
 log = logging.getLogger("red.apriltalk")
 log.setLevel(logging.DEBUG)
 
-STYLE_SUFFIX = ", in a futuristic neo-cyberpunk aesthetic"
+# -----------------------------------
+# Defaults that can be overridden via config
+# -----------------------------------
+DEFAULT_STYLE_SUFFIX = ", in a futuristic neo-cyberpunk aesthetic"
+DEFAULT_IMG_PROMPT_SYSTEM = "You write exactly ONE single-line image prompt; no commentary, no quotes."
 
 EMOTION_GIFS = {
     "happy": [
@@ -57,19 +61,25 @@ EMOTION_GIFS = {
 
 
 class AprilTalk(commands.Cog):
-    """April: chat + voice + Loki recall (keeps your logging cog separate)"""
+    """
+    April: chat + voice + Loki recall
+
+    IMPORTANT FIXES:
+    - Chat history is now PER-USER PER-CHANNEL (no more cross-user bleed).
+    - Recall (FETCH) is stored under the TARGET USER (the mention/arg), never the invoker.
+    - Only the current user's recall is injected into responses.
+    """
 
     def __init__(self, bot: Red):
         self.bot = bot
-        # IMPORTANT: keep same identifier so your existing settings persist
         self.config = Config.get_conf(self, identifier=1398462)
 
         self.session = aiohttp.ClientSession()
 
-        # per-channel conversation
-        self.history: dict[int, deque] = {}
-        # per-channel recall memory {channel_id: {username: [lines...]}}
-        self.recall: dict[int, dict[str, list[str]]] = {}
+        # Per-(channel,user) conversation history
+        self.history: Dict[Tuple[int, int], deque] = {}
+        # Per-(channel,user) recall memory
+        self.recall: Dict[Tuple[int, int], List[str]] = {}
 
         # perf tunables
         self._api_sem = asyncio.Semaphore(3)   # cap concurrent external calls
@@ -82,7 +92,7 @@ class AprilTalk(commands.Cog):
         self.tts_dir.mkdir(exist_ok=True, parents=True)
         self.tts_files = set()
 
-        # defaults
+        # defaults (includes prompt customization)
         self.config.register_global(
             deepseek_key="",
             anthropic_key="",
@@ -94,6 +104,9 @@ class AprilTalk(commands.Cog):
             max_tokens=2048,
             system_prompt="You are April, a helpful AI assistant for Discord. Default to useful answers. Be concise and kind.",
             smert_prompt="You are April in 'smert' mode - an incredibly intelligent, witty, and creative AI assistant.",
+            # image-related prompts (configurable)
+            image_style_suffix=DEFAULT_STYLE_SUFFIX,
+            image_prompt_system=DEFAULT_IMG_PROMPT_SYSTEM,
             tts_enabled=False,
             text_response_when_voice=True,
             max_history=20,
@@ -110,7 +123,7 @@ class AprilTalk(commands.Cog):
         self.config.register_user(
             smert_mode=False,
             custom_anthropic_key="",
-            custom_smert_prompt="",
+            custom_smert_prompt="",  # user-level smert system prompt override
         )
 
     # -----------------------------------
@@ -133,15 +146,29 @@ class AprilTalk(commands.Cog):
     # -----------------------------------
     # Helpers
     # -----------------------------------
+    def _hist_key(self, ctx: commands.Context) -> Tuple[int, int]:
+        """Per-user per-channel history key."""
+        return (ctx.channel.id, ctx.author.id)
+
     async def _with_limit(self, sem: asyncio.Semaphore, coro):
         async with sem:
             return await coro
 
-    def style_prompt(self, prompt: str) -> str:
+    async def _get_image_style_suffix(self) -> str:
+        suffix = await self.config.image_style_suffix()
+        return suffix or ""
+
+    def _contains_style_words(self, text: str) -> bool:
+        t = text.lower()
+        return any(k in t for k in ["cyberpunk", "synthwave", "futuristic", "sci-fi", "science fiction", "blade runner"])
+
+    async def style_prompt(self, prompt: str) -> str:
+        """Append the configured image style suffix unless the prompt already has a strong style hint."""
         p = prompt.strip()
-        if any(k in p.lower() for k in ["cyberpunk", "synthwave", "futuristic", "sci-fi", "science fiction", "blade runner"]):
+        if self._contains_style_words(p):
             return p
-        return p + STYLE_SUFFIX
+        suffix = await self._get_image_style_suffix()
+        return (p + suffix).strip()
 
     def maybe_extract_draw_prompt(self, text: str) -> Optional[str]:
         m = re.search(r"<draw>(.*?)</draw>", text, flags=re.IGNORECASE | re.DOTALL)
@@ -202,7 +229,6 @@ class AprilTalk(commands.Cog):
             allowed_int = int(allowed) if allowed else None
         except Exception:
             allowed_int = None
-        # owner can always manage
         try:
             if await self.bot.is_owner(ctx.author):
                 return True
@@ -238,12 +264,9 @@ class AprilTalk(commands.Cog):
             return str(uid), (user.name if user else None)
         return None, mention.lstrip("@")
 
-    # ---- LogQL helpers (MUST be inside class) ----
+    # ---- LogQL helpers ----
     def _logql_quote(self, s: str) -> str:
-        """
-        Safely quote a value for LogQL equality matches.
-        Escapes backslashes and double quotes.
-        """
+        """Safely quote a value for LogQL equality matches (escape backslashes and double quotes)."""
         if s is None:
             return ""
         return s.replace("\\", "\\\\").replace('"', '\\"')
@@ -256,13 +279,6 @@ class AprilTalk(commands.Cog):
         user_id: Optional[str],
         user_name: Optional[str],
     ) -> str:
-        """
-        Build a LogQL query that:
-          1) selects the right stream (labels),
-          2) parses JSON,
-          3) lifts nested JSON fields into labels via `label_format`,
-          4) filters on those lifted labels.
-        """
         base = (
             f'{{app="discord-bot",event_type="message",guild_id="{guild_id}",channel_id="{channel_id}"}} '
             f"| json"
@@ -336,7 +352,7 @@ class AprilTalk(commands.Cog):
         p = prompt.strip()
         if p.lower().startswith("me "):
             p = p[3:].strip()
-        styled = self.style_prompt(p)
+        styled = await self.style_prompt(p)
         try:
             async with ctx.typing():
                 png = await self._with_limit(self._api_sem, self.generate_openai_image_png(styled, size="1024x1024"))
@@ -359,7 +375,7 @@ class AprilTalk(commands.Cog):
         await self.config.sleep_user_id.set(str(uid))
         await ctx.send(f"🔒 Allowed user set to <@{uid}>.")
 
-    # Loki config (owner) – also mirrored under .aprilcfg
+    # Loki config (owner)
     @april.command(name="lokiurl")
     @commands.is_owner()
     async def lokiurl_cmd(self, ctx: commands.Context, url: str):
@@ -410,15 +426,32 @@ class AprilTalk(commands.Cog):
     @april.command(name="fetch")
     @commands.guild_only()
     async def april_fetch(self, ctx: commands.Context, user_mention: str, since: Optional[str] = "24h", limit: Optional[int] = 20):
-        """Fetch recent messages for @user from Loki and cache as recall memory."""
+        """
+        Fetch recent messages for TARGET @user from Loki and cache as recall memory.
+        ALWAYS stores recall under the mentioned user, not the invoker.
+        """
         if not await self._is_allowed_to_interact(ctx):
             return
         if not ctx.guild:
             return await ctx.send("❌ Must be used in a server channel.")
 
-        uid, uname = self._mention_to_user(user_mention)
-        if not uid and not uname:
-            return await ctx.send("❌ I need an @mention or a username.")
+        uid_str, uname = self._mention_to_user(user_mention)
+        target_uid: Optional[int] = int(uid_str) if uid_str else None
+
+        # Try to resolve by name if only a name was provided
+        if not target_uid and uname:
+            try:
+                member = discord.utils.find(
+                    lambda m: m.name == uname or m.display_name == uname,
+                    ctx.guild.members
+                )
+                if member:
+                    target_uid = member.id
+            except Exception:
+                pass
+
+        if not target_uid and not uname:
+            return await ctx.send("❌ I need an @mention or a resolvable username.")
 
         limit = max(1, min(int(limit or 20), 200))
         end_ns = int(time.time() * 1_000_000_000)
@@ -427,8 +460,8 @@ class AprilTalk(commands.Cog):
         logql = self._build_logql_for_user(
             guild_id=ctx.guild.id,
             channel_id=ctx.channel.id,
-            user_id=uid,
-            user_name=uname if not uid else None,
+            user_id=str(target_uid) if target_uid else None,
+            user_name=None if target_uid else uname,
         )
 
         try:
@@ -445,9 +478,10 @@ class AprilTalk(commands.Cog):
                 rows.sort(key=lambda x: x[0], reverse=True)
                 rows = rows[:limit]
 
-                lines_out = []
-                recall_lines = []
+                lines_out: List[str] = []
+                recall_lines: List[str] = []
                 display_name = None
+
                 for ts, line in rows:
                     content = None
                     author_name = None
@@ -461,23 +495,24 @@ class AprilTalk(commands.Cog):
                         content = m.group(1) if m else line
                         m2 = re.search(r'"author"\s*:\s*{[^}]*"name"\s*:\s*"([^"]*)"', line)
                         author_name = m2.group(1) if m2 else None
+
                     when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts / 1_000_000_000))
-                    who = author_name or uname or uid or "user"
+                    who = author_name or uname or (str(target_uid) if target_uid else "user")
                     display_name = display_name or who
                     text = content if content is not None else line
                     lines_out.append(f"**{who}** at {when}: {text}")
                     recall_lines.append(text)
 
-                ch = ctx.channel.id
-                if ch not in self.recall:
-                    self.recall[ch] = {}
-                key = display_name or (uname or uid or "user")
-                self.recall[ch][key] = recall_lines
+                # Store recall strictly under (channel, TARGET_USER_ID)
+                if target_uid:
+                    self.recall[(ctx.channel.id, target_uid)] = recall_lines
+                # If we couldn't resolve an ID, don't pollute anything else; still show output.
 
                 for page in pagify("\n".join(lines_out), delims=["\n"], page_length=1800):
                     await ctx.send(page)
 
-                await ctx.send(f"🧠 Cached {len(recall_lines)} lines as recall for **{key}**. I’ll use them in next replies.")
+                human_tag = f"<@{target_uid}>" if target_uid else (display_name or uname or "user")
+                await ctx.send(f"🧠 Cached {len(recall_lines)} lines as recall for **{human_tag}**. I’ll use them in next replies to that user.")
         except Exception as e:
             await ctx.send(f"⚠️ Loki query failed: `{e}`")
 
@@ -526,12 +561,14 @@ class AprilTalk(commands.Cog):
 
     @april.command(name="clearhistory")
     async def clear_history(self, ctx: commands.Context):
-        if not await self._is_allowed_to_interact(ctx):
-            return
-        ch = ctx.channel.id
-        if ch in self.history:
-            self.history[ch].clear()
-        await ctx.send("✅ Channel history cleared.")
+        """
+        Clear ONLY YOUR chat history with April in this channel.
+        (Per-user per-channel; does not affect others.)
+        """
+        key = self._hist_key(ctx)
+        if key in self.history:
+            self.history[key].clear()
+        await ctx.send("✅ Your channel history with me is cleared.")
 
     @april.command(name="smert")
     async def toggle_smert_mode(self, ctx: commands.Context):
@@ -565,29 +602,28 @@ class AprilTalk(commands.Cog):
         user_cfg = self.config.user(ctx.author)
         smert_mode = await user_cfg.smert_mode()
 
+        # pick system prompt (global or user-level smert override)
+        system_prompt = await self.config.system_prompt()
+        if smert_mode:
+            user_smert_override = await user_cfg.custom_smert_prompt()
+            system_prompt = user_smert_override or (await self.config.smert_prompt())
+
         async with ctx.typing():
             try:
-                ch = ctx.channel.id
-                if ch not in self.history:
+                key = self._hist_key(ctx)
+                if key not in self.history:
                     max_hist = await self.config.max_history()
-                    self.history[ch] = deque(maxlen=max_hist * 2)
+                    self.history[key] = deque(maxlen=max_hist * 2)
 
-                system_prompt = (await self.config.smert_prompt()) if smert_mode else (await self.config.system_prompt())
                 messages = [{"role": "system", "content": system_prompt}]
 
-                # inject recall
-                ch_recall = self.recall.get(ch, {})
-                if ch_recall:
-                    mems = []
-                    for uname, lines in ch_recall.items():
-                        if not lines:
-                            continue
-                        subset = lines[:5]
-                        mems.append(f"{uname} recent: " + " | ".join(subset))
-                    if mems:
-                        messages.append({"role": "system", "content": "[memory] " + " || ".join(mems)})
+                # inject ONLY THIS USER'S recall for THIS CHANNEL
+                rec = self.recall.get(key)
+                if rec:
+                    subset = rec[:5]
+                    messages.append({"role": "system", "content": "[memory] " + " | ".join(subset)})
 
-                messages.extend(self.history[ch])
+                messages.extend(self.history[key])
                 messages.append({"role": "user", "content": input_text})
 
                 if smert_mode:
@@ -598,8 +634,8 @@ class AprilTalk(commands.Cog):
                 draw_prompt = self.maybe_extract_draw_prompt(resp)
                 clean = re.sub(r"<draw>.*?</draw>", "", resp, flags=re.IGNORECASE | re.DOTALL).strip()
 
-                self.history[ch].append({"role": "user", "content": input_text})
-                self.history[ch].append({"role": "assistant", "content": clean})
+                self.history[key].append({"role": "user", "content": input_text})
+                self.history[key].append({"role": "assistant", "content": clean})
 
                 tasks = []
                 if not (use_voice and not await self.config.text_response_when_voice()):
@@ -608,7 +644,7 @@ class AprilTalk(commands.Cog):
                     tasks.append(asyncio.create_task(self.speak_response(ctx, clean)))
 
                 if draw_prompt:
-                    styled = self.style_prompt(draw_prompt)
+                    styled = await self.style_prompt(draw_prompt)
 
                     async def _draw_and_send():
                         try:
@@ -784,29 +820,33 @@ class AprilTalk(commands.Cog):
     async def _draw_what_you_think(self, ctx: commands.Context):
         async with ctx.typing():
             try:
-                ch = ctx.channel.id
-                if ch not in self.history:
+                key = self._hist_key(ctx)
+                if key not in self.history:
                     max_hist = await self.config.max_history()
-                    self.history[ch] = deque(maxlen=max_hist * 2)
+                    self.history[key] = deque(maxlen=max_hist * 2)
                 system_prompt = await self.config.system_prompt()
                 messages = [{"role": "system", "content": system_prompt}]
-                messages.extend(self.history[ch])
+                messages.extend(self.history[key])
                 messages.append({"role": "user", "content": "User: I know what you're thinking, draw me it!"})
+
                 chat_resp = await self._with_limit(self._api_sem, self.query_deepseek(ctx.author.id, messages))
+
+                # configurable "post system prompt" for image prompt generation
+                img_sys = await self.config.image_prompt_system()
                 img_prompt = await self._with_limit(
                     self._api_sem,
                     self.query_deepseek(
                         0,
-                        [{"role": "system", "content": "You write exactly ONE single-line image prompt; no commentary, no quotes."}]
+                        [{"role": "system", "content": img_sys}]
                         + messages[-10:]
                         + [{"role": "assistant", "content": chat_resp}],
                     ),
                 )
-                styled = self.style_prompt(img_prompt)
+                styled = await self.style_prompt(img_prompt)
                 png = await self._with_limit(self._api_sem, self.generate_openai_image_png(styled, size="1024x1024"))
                 await ctx.send(file=discord.File(BytesIO(png), filename="april_draw.png"), content=f"{chat_resp}\n\n**Image:** {styled}")
-                self.history[ch].append({"role": "user", "content": "I know what you're thinking, draw me it!"})
-                self.history[ch].append({"role": "assistant", "content": chat_resp + f"\n[Image: {styled}]"})
+                self.history[key].append({"role": "user", "content": "I know what you're thinking, draw me it!"})
+                self.history[key].append({"role": "assistant", "content": chat_resp + f"\n[Image: {styled}]"})
             except Exception as e:
                 await ctx.send(f"⚠️ Couldn't complete the draw-what-you-think flow: `{e}`")
 
@@ -820,7 +860,42 @@ class AprilTalk(commands.Cog):
         if ctx.invoked_subcommand is None:
             await self.show_settings(ctx)
 
-    # API keys & model knobs — no reactions, plain confirmation
+    # Prompt customization commands
+    @aprilconfig.command(name="systemprompt")
+    @commands.is_owner()
+    async def cfg_systemprompt(self, ctx: commands.Context, *, prompt: str):
+        await self.config.system_prompt.set(prompt.strip())
+        await ctx.send("✅ System prompt updated.")
+
+    @aprilconfig.command(name="smertprompt")
+    @commands.is_owner()
+    async def cfg_smertprompt(self, ctx: commands.Context, *, prompt: str):
+        await self.config.smert_prompt.set(prompt.strip())
+        await ctx.send("✅ Smert prompt updated.")
+
+    @aprilconfig.command(name="usersmertprompt")
+    @commands.is_owner()
+    async def cfg_user_smertprompt(self, ctx: commands.Context, member: Optional[discord.Member] = None, *, prompt: str):
+        target = member or ctx.author
+        await self.config.user(target).custom_smert_prompt.set(prompt.strip())
+        await ctx.send(f"✅ Smert prompt override set for {target.display_name}.")
+
+    @aprilconfig.command(name="imagesuffix")
+    @commands.is_owner()
+    async def cfg_imagesuffix(self, ctx: commands.Context, *, suffix: str):
+        sfx = suffix.strip()
+        if sfx and not sfx.startswith(","):
+            sfx = " " + sfx
+        await self.config.image_style_suffix.set(sfx)
+        await ctx.send("🎨 Image style suffix updated.")
+
+    @aprilconfig.command(name="imgpromptsys")
+    @commands.is_owner()
+    async def cfg_imgpromptsys(self, ctx: commands.Context, *, prompt: str):
+        await self.config.image_prompt_system.set(prompt.strip())
+        await ctx.send("🖼️ Image prompt system updated.")
+
+    # API keys & model knobs
     @aprilconfig.command()
     async def deepseekkey(self, ctx: commands.Context, key: str):
         await self.config.deepseek_key.set(key)
@@ -897,8 +972,9 @@ class AprilTalk(commands.Cog):
     async def maxhistory(self, ctx: commands.Context, num: int):
         if 1 <= num <= 20:
             await self.config.max_history.set(num)
-            for ch in self.history:
-                self.history[ch] = deque(self.history[ch], maxlen=num * 2)
+            # Rebuild existing deques with new size
+            for k in list(self.history.keys()):
+                self.history[k] = deque(self.history[k], maxlen=num * 2)
             await ctx.send(f"✅ Max history set to `{num}` exchanges")
         else:
             await ctx.send("❌ Value must be between 1 and 20")
@@ -931,7 +1007,6 @@ class AprilTalk(commands.Cog):
     async def cfg_lokiverify(self, ctx: commands.Context):
         await self.lokiverify_cmd(ctx)
 
-    # Sleep in .aprilcfg
     @aprilconfig.command(name="sleep")
     async def cfg_sleep(self, ctx: commands.Context, enabled: bool):
         await self.config.sleep_enabled.set(bool(enabled))
@@ -962,12 +1037,24 @@ class AprilTalk(commands.Cog):
         e.add_field(name="Text with Voice", value="✅" if cfg['text_response_when_voice'] else "❌", inline=True)
         e.add_field(name="Emotion GIFs", value="✅" if cfg['use_gifs'] else "❌", inline=True)
         e.add_field(name="Loki URL", value=f"{cfg.get('loki_url','')}", inline=False)
-        e.add_field(name="Sleep Mode", value="😴 ON" if cfg.get("sleep_enabled") else "💬 OFF", inline=True)
-        e.add_field(name="Sleep Allowed User", value=f"<@{cfg.get('sleep_user_id','')}>" if cfg.get("sleep_user_id") else "—", inline=True)
+
+        # Show prompts (trimmed)
         sp = cfg['system_prompt'][:200] + ("..." if len(cfg['system_prompt']) > 200 else "")
         sm = cfg['smert_prompt'][:200] + ("..." if len(cfg['smert_prompt']) > 200 else "")
+        img_sys = cfg.get('image_prompt_system') or DEFAULT_IMG_PROMPT_SYSTEM
+        img_sys_short = img_sys[:200] + ("..." if len(img_sys) > 200 else "")
+        img_suffix = cfg.get('image_style_suffix') or ""
+        img_suffix_short = img_suffix[:200] + ("..." if len(img_suffix) > 200 else "")
+
         e.add_field(name="System Prompt", value=f"```{sp}```", inline=False)
         e.add_field(name="Smert Prompt", value=f"```{sm}```", inline=False)
+        e.add_field(name="Image Prompt System", value=f"```{img_sys_short}```", inline=False)
+        e.add_field(name="Image Style Suffix", value=f"```{img_suffix_short or '—'}```", inline=False)
+
+        # Sleep state
+        e.add_field(name="Sleep Mode", value="😴 ON" if cfg.get("sleep_enabled") else "💬 OFF", inline=True)
+        e.add_field(name="Sleep Allowed User", value=f"<@{cfg.get('sleep_user_id','')}>" if cfg.get("sleep_user_id") else "—", inline=True)
+
         await ctx.send(embed=e)
 
 
