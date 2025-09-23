@@ -64,10 +64,12 @@ class AprilTalk(commands.Cog):
     """
     April: chat + voice + Loki recall
 
-    IMPORTANT FIXES:
-    - Chat history is now PER-USER PER-CHANNEL (no more cross-user bleed).
-    - Recall (FETCH) is stored under the TARGET USER (the mention/arg), never the invoker.
+    FIXES INCLUDED:
+    - Chat history is PER-USER PER-CHANNEL (no cross-user bleed).
+    - Recall (FETCH) is stored under the TARGET USER, not the invoker.
     - Only the current user's recall is injected into responses.
+    - Restored prompt customization (system/smert + image post-system + style suffix).
+    - Restored/solid draw flow. `style_prompt` is synchronous again.
     """
 
     def __init__(self, bot: Red):
@@ -91,6 +93,10 @@ class AprilTalk(commands.Cog):
         self.tts_dir = Path(cog_data_path(self)) / "tts"
         self.tts_dir.mkdir(exist_ok=True, parents=True)
         self.tts_files = set()
+
+        # in-memory caches for sync access in draw/style helpers
+        self._image_style_suffix: str = DEFAULT_STYLE_SUFFIX
+        self._image_prompt_system: str = DEFAULT_IMG_PROMPT_SYSTEM
 
         # defaults (includes prompt customization)
         self.config.register_global(
@@ -126,6 +132,12 @@ class AprilTalk(commands.Cog):
             custom_smert_prompt="",  # user-level smert system prompt override
         )
 
+    async def cog_load(self):
+        """Load persisted config into caches so draw/style work immediately after load."""
+        cfg = await self.config.all()
+        self._image_style_suffix = cfg.get("image_style_suffix") or DEFAULT_STYLE_SUFFIX
+        self._image_prompt_system = cfg.get("image_prompt_system") or DEFAULT_IMG_PROMPT_SYSTEM
+
     # -----------------------------------
     # Lifecycle
     # -----------------------------------
@@ -154,21 +166,23 @@ class AprilTalk(commands.Cog):
         async with sem:
             return await coro
 
-    async def _get_image_style_suffix(self) -> str:
-        suffix = await self.config.image_style_suffix()
-        return suffix or ""
-
     def _contains_style_words(self, text: str) -> bool:
         t = text.lower()
         return any(k in t for k in ["cyberpunk", "synthwave", "futuristic", "sci-fi", "science fiction", "blade runner"])
 
-    async def style_prompt(self, prompt: str) -> str:
-        """Append the configured image style suffix unless the prompt already has a strong style hint."""
+    def style_prompt(self, prompt: str) -> str:
+        """
+        Sync helper so draw flow can't break from awaiting.
+        Uses in-memory cache that mirrors config.
+        """
         p = prompt.strip()
         if self._contains_style_words(p):
             return p
-        suffix = await self._get_image_style_suffix()
-        return (p + suffix).strip()
+        # ensure spacing looks nice if suffix doesn't start with comma
+        sfx = self._image_style_suffix or ""
+        if sfx and not sfx.startswith(",") and not p.endswith((",", ";", ".")):
+            return f"{p} {sfx}".strip()
+        return (p + sfx).strip()
 
     def maybe_extract_draw_prompt(self, text: str) -> Optional[str]:
         m = re.search(r"<draw>(.*?)</draw>", text, flags=re.IGNORECASE | re.DOTALL)
@@ -352,7 +366,7 @@ class AprilTalk(commands.Cog):
         p = prompt.strip()
         if p.lower().startswith("me "):
             p = p[3:].strip()
-        styled = await self.style_prompt(p)
+        styled = self.style_prompt(p)
         try:
             async with ctx.typing():
                 png = await self._with_limit(self._api_sem, self.generate_openai_image_png(styled, size="1024x1024"))
@@ -506,7 +520,6 @@ class AprilTalk(commands.Cog):
                 # Store recall strictly under (channel, TARGET_USER_ID)
                 if target_uid:
                     self.recall[(ctx.channel.id, target_uid)] = recall_lines
-                # If we couldn't resolve an ID, don't pollute anything else; still show output.
 
                 for page in pagify("\n".join(lines_out), delims=["\n"], page_length=1800):
                     await ctx.send(page)
@@ -644,7 +657,7 @@ class AprilTalk(commands.Cog):
                     tasks.append(asyncio.create_task(self.speak_response(ctx, clean)))
 
                 if draw_prompt:
-                    styled = await self.style_prompt(draw_prompt)
+                    styled = self.style_prompt(draw_prompt)
 
                     async def _draw_and_send():
                         try:
@@ -831,8 +844,8 @@ class AprilTalk(commands.Cog):
 
                 chat_resp = await self._with_limit(self._api_sem, self.query_deepseek(ctx.author.id, messages))
 
-                # configurable "post system prompt" for image prompt generation
-                img_sys = await self.config.image_prompt_system()
+                # configurable "post system prompt" for image prompt generation (cached for sync access)
+                img_sys = self._image_prompt_system
                 img_prompt = await self._with_limit(
                     self._api_sem,
                     self.query_deepseek(
@@ -842,7 +855,7 @@ class AprilTalk(commands.Cog):
                         + [{"role": "assistant", "content": chat_resp}],
                     ),
                 )
-                styled = await self.style_prompt(img_prompt)
+                styled = self.style_prompt(img_prompt)
                 png = await self._with_limit(self._api_sem, self.generate_openai_image_png(styled, size="1024x1024"))
                 await ctx.send(file=discord.File(BytesIO(png), filename="april_draw.png"), content=f"{chat_resp}\n\n**Image:** {styled}")
                 self.history[key].append({"role": "user", "content": "I know what you're thinking, draw me it!"})
@@ -884,15 +897,17 @@ class AprilTalk(commands.Cog):
     @commands.is_owner()
     async def cfg_imagesuffix(self, ctx: commands.Context, *, suffix: str):
         sfx = suffix.strip()
-        if sfx and not sfx.startswith(","):
-            sfx = " " + sfx
+        # don't force a comma; let user decide. Keep display nice in style_prompt.
         await self.config.image_style_suffix.set(sfx)
+        self._image_style_suffix = sfx or DEFAULT_STYLE_SUFFIX
         await ctx.send("🎨 Image style suffix updated.")
 
     @aprilconfig.command(name="imgpromptsys")
     @commands.is_owner()
     async def cfg_imgpromptsys(self, ctx: commands.Context, *, prompt: str):
-        await self.config.image_prompt_system.set(prompt.strip())
+        txt = prompt.strip()
+        await self.config.image_prompt_system.set(txt)
+        self._image_prompt_system = txt or DEFAULT_IMG_PROMPT_SYSTEM
         await ctx.send("🖼️ Image prompt system updated.")
 
     # API keys & model knobs
