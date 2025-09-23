@@ -94,9 +94,9 @@ class AprilTalk(commands.Cog):
             max_tokens=2048,
             system_prompt="You are April, a helpful AI assistant for Discord. Default to useful answers. Be concise and kind.",
             smert_prompt="You are April in 'smert' mode - an incredibly intelligent, witty, and creative AI assistant.",
-            tts_enabled=True,
+            tts_enabled=False,
             text_response_when_voice=True,
-            max_history=5,
+            max_history=20,
             use_gifs=True,
             max_message_length=1800,
             # Loki (accepts base or push URL)
