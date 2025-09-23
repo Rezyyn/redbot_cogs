@@ -152,11 +152,16 @@ class AprilTalk(commands.Cog):
 
     async def detect_emotion(self, text: str) -> Optional[str]:
         t = text.lower()
-        if any(w in t for w in ["happy", "great", "awesome", "excellent", "wonderful", "amazing"]): return "happy"
-        if any(w in t for w in ["think", "consider", "ponder", "wonder", "hmm"]): return "thinking"
-        if any(w in t for w in ["confused", "don't understand", "what", "huh", "unclear"]): return "confused"
-        if any(w in t for w in ["excited", "can't wait", "wow", "amazing!"]): return "excited"
-        if any(w in t for w in ["sad", "sorry", "unfortunately", "regret"]): return "sad"
+        if any(w in t for w in ["happy", "great", "awesome", "excellent", "wonderful", "amazing"]):
+            return "happy"
+        if any(w in t for w in ["think", "consider", "ponder", "wonder", "hmm"]):
+            return "thinking"
+        if any(w in t for w in ["confused", "don't understand", "what", "huh", "unclear"]):
+            return "confused"
+        if any(w in t for w in ["excited", "can't wait", "wow", "amazing!"]):
+            return "excited"
+        if any(w in t for w in ["sad", "sorry", "unfortunately", "regret"]):
+            return "sad"
         return None
 
     # Lavalink helpers
@@ -213,10 +218,16 @@ class AprilTalk(commands.Cog):
         return raw
 
     def _since_to_ns(self, since: str) -> int:
-        m = re.fullmatch(r"(\d+)([hd])", since or "24h")
+        # supports 15m / 2h / 3d
+        m = re.fullmatch(r"(\d+)([mhd])", since or "24h")
         n = int(m.group(1)) if m else 24
-        unit = m.group(2) if m else "h"
-        sec = n * 3600 if unit == "h" else n * 86400
+        unit = (m.group(2) if m else "h")
+        if unit == "m":
+            sec = n * 60
+        elif unit == "h":
+            sec = n * 3600
+        else:
+            sec = n * 86400
         return (int(time.time()) - sec) * 1_000_000_000
 
     def _mention_to_user(self, mention: str):
@@ -227,59 +238,53 @@ class AprilTalk(commands.Cog):
             return str(uid), (user.name if user else None)
         return None, mention.lstrip("@")
 
-def _logql_quote(self, s: str) -> str:
-    """
-    Safely quote a value for LogQL equality matches.
-    Escapes backslashes and double quotes.
-    """
-    if s is None:
-        return ""
-    return s.replace("\\", "\\\\").replace('"', '\\"')
+    # ---- LogQL helpers (MUST be inside class) ----
+    def _logql_quote(self, s: str) -> str:
+        """
+        Safely quote a value for LogQL equality matches.
+        Escapes backslashes and double quotes.
+        """
+        if s is None:
+            return ""
+        return s.replace("\\", "\\\\").replace('"', '\\"')
 
-
-def _build_logql_for_user(
-    self,
-    *,
-    guild_id: int,
-    channel_id: int,
-    user_id: Optional[str],
-    user_name: Optional[str],
-) -> str:
-    """
-    Build a LogQL query that:
-      1) selects the right stream (labels),
-      2) parses JSON,
-      3) LIFTS nested JSON fields into labels via `label_format`,
-      4) filters on those lifted labels.
-
-    This avoids `unexpected .` parser errors from dotted paths like `author.id`.
-    """
-    # 1 + 2) select stream & parse JSON
-    base = (
-        f'{{app="discord-bot",event_type="message",guild_id="{guild_id}",channel_id="{channel_id}"}} '
-        f'| json'
-    )
-
-    # 3) Lift nested fields to labels, then 4) filter on them
-    if user_id:
-        uid = self._logql_quote(user_id)
-        # author.id -> author_id
-        return (
-            base
-            + ' | label_format author_id="{{.author.id}}"'
-            + f' | author_id="{uid}"'
+    def _build_logql_for_user(
+        self,
+        *,
+        guild_id: int,
+        channel_id: int,
+        user_id: Optional[str],
+        user_name: Optional[str],
+    ) -> str:
+        """
+        Build a LogQL query that:
+          1) selects the right stream (labels),
+          2) parses JSON,
+          3) lifts nested JSON fields into labels via `label_format`,
+          4) filters on those lifted labels.
+        """
+        base = (
+            f'{{app="discord-bot",event_type="message",guild_id="{guild_id}",channel_id="{channel_id}"}} '
+            f"| json"
         )
 
-    if user_name:
-        uname = self._logql_quote(user_name)
-        # author.name -> author_name
-        return (
-            base
-            + ' | label_format author_name="{{.author.name}}"'
-            + f' | author_name="{uname}"'
-        )
+        if user_id:
+            uid = self._logql_quote(user_id)
+            return (
+                base
+                + ' | label_format author_id="{{.author.id}}"'
+                + f' | author_id="{uid}"'
+            )
 
-    return base
+        if user_name:
+            uname = self._logql_quote(user_name)
+            return (
+                base
+                + ' | label_format author_name="{{.author.name}}"'
+                + f' | author_name="{uname}"'
+            )
+
+        return base
 
     async def _loki_query_range(self, query: str, start_ns: int, end_ns: int, limit: int = 50):
         cfg = await self.config.all()
@@ -661,13 +666,13 @@ def _build_logql_for_user(
     # TTS / Images / Models
     # -----------------------------------
     def clean_text_for_tts(self, text: str) -> str:
-        text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
-        text = re.sub(r'\*(.*?)\*', r'\1', text)
-        text = re.sub(r'`(.*?)`', r'\1', text)
-        text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)
-        text = re.sub(r'http[s]?://\S+', '', text)
-        text = re.sub(r'\s+', ' ', text).strip()
-        return text[:1000].rsplit(' ', 1)[0] + "..." if len(text) > 1000 else text
+        text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
+        text = re.sub(r"\*(.*?)\*", r"\1", text)
+        text = re.sub(r"`(.*?)`", r"\1", text)
+        text = re.sub(r"```.*?```", "", text, flags=re.DOTALL)
+        text = re.sub(r"http[s]?://\S+", "", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text[:1000].rsplit(" ", 1)[0] + "..." if len(text) > 1000 else text
 
     async def speak_response(self, ctx: commands.Context, text: str):
         tts_key = await self.config.tts_key()
@@ -680,7 +685,7 @@ def _build_logql_for_user(
         if not clean:
             return
         if len(clean) > 800:
-            clean = clean[:800].rsplit(' ', 1)[0] + "..."
+            clean = clean[:800].rsplit(" ", 1)[0] + "..."
         audio = await self._with_limit(self._tts_sem, self.generate_tts_audio(clean, tts_key))
         if not audio:
             return
@@ -788,12 +793,15 @@ def _build_logql_for_user(
                 messages.extend(self.history[ch])
                 messages.append({"role": "user", "content": "User: I know what you're thinking, draw me it!"})
                 chat_resp = await self._with_limit(self._api_sem, self.query_deepseek(ctx.author.id, messages))
-                img_prompt = await self._with_limit(self._api_sem, self.query_deepseek(
-                    0,
-                    [{"role": "system", "content": "You write exactly ONE single-line image prompt; no commentary, no quotes."}]
-                    + messages[-10:]
-                    + [{"role": "assistant", "content": chat_resp}]
-                ))
+                img_prompt = await self._with_limit(
+                    self._api_sem,
+                    self.query_deepseek(
+                        0,
+                        [{"role": "system", "content": "You write exactly ONE single-line image prompt; no commentary, no quotes."}]
+                        + messages[-10:]
+                        + [{"role": "assistant", "content": chat_resp}],
+                    ),
+                )
                 styled = self.style_prompt(img_prompt)
                 png = await self._with_limit(self._api_sem, self.generate_openai_image_png(styled, size="1024x1024"))
                 await ctx.send(file=discord.File(BytesIO(png), filename="april_draw.png"), content=f"{chat_resp}\n\n**Image:** {styled}")
