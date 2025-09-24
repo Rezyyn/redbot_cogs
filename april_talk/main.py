@@ -458,7 +458,7 @@ class AprilTalk(commands.Cog):
         }
         await self._loki_push([{"stream": stream_labels, "values": [[ns_timestamp, json.dumps(message_data)]]}])
 
-    @commands.Cog.listener())
+    @commands.Cog.listener()
     async def on_message_edit(self, before: discord.Message, after: discord.Message):
         if after.author.bot or not await self.config.loki_push_enabled():
             return
