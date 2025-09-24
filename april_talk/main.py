@@ -12,22 +12,18 @@ import json
 from collections import deque
 from pathlib import Path
 from io import BytesIO
-from typing import Optional, Tuple, List
+from typing import Optional, List, Dict
 
 from redbot.core import commands, Config
 from redbot.core.bot import Red
 from redbot.core.data_manager import cog_data_path
 from redbot.core.utils.chat_formatting import pagify
 
-# -----------------------------------
-# Logger
-# -----------------------------------
 log = logging.getLogger("red.apriltalk")
 log.setLevel(logging.DEBUG)
 
 STYLE_SUFFIX = ", in a futuristic neo-cyberpunk aesthetic"
 
-# Fallback GIFs if Tenor is disabled/unset
 FALLBACK_GIFS = {
     "happy": [
         "https://media.giphy.com/media/XbxZ41fWLeRECPsGIJ/giphy.gif",
@@ -58,31 +54,31 @@ FALLBACK_GIFS = {
 
 TENOR_ENDPOINT = "https://tenor.googleapis.com/v2/search"
 
-# -----------------------------------
-# Cog
-# -----------------------------------
+
 class AprilTalk(commands.Cog):
-    """April: chat + voice + Loki recall + Tenor GIFs + Vision intake"""
+    """April: chat + voice + Loki recall + Tenor GIFs + Vision intake + context-aware drawing"""
 
     def __init__(self, bot: Red):
         self.bot = bot
-        # IMPORTANT: keep same identifier so your existing settings persist
+        # keep the SAME identifier to preserve existing config
         self.config = Config.get_conf(self, identifier=1398462)
 
         self.session = aiohttp.ClientSession()
 
-        # per-channel conversation
-        self.history: dict[int, deque] = {}
-        # per-channel recall memory {channel_id: {username: [lines...]}}
-        self.recall: dict[int, dict[str, list[str]]] = {}
+        # per-channel conversation memory and recall cache
+        self.history: Dict[int, deque] = {}
+        self.recall: Dict[int, Dict[str, List[str]]] = {}
+
+        # conversational context per channel
+        self.ctx_state: Dict[int, Dict] = {}  # {channel_id: {"last_subject": str, "last_image_prompt": str}}
 
         # perf tunables
-        self._api_sem = asyncio.Semaphore(3)   # cap concurrent external calls
+        self._api_sem = asyncio.Semaphore(3)   # limit concurrent external calls
         self._tts_sem = asyncio.Semaphore(1)   # serialize TTS
-        self._edit_delay = 0.03                # reduce Discord edit spam
-        self._chunk_size = 180                 # streamed edit chunk size
+        self._edit_delay = 0.03
+        self._chunk_size = 180
 
-        # files
+        # TTS files
         self.tts_dir = Path(cog_data_path(self)) / "tts"
         self.tts_dir.mkdir(exist_ok=True, parents=True)
         self.tts_files = set()
@@ -103,19 +99,19 @@ class AprilTalk(commands.Cog):
             text_response_when_voice=True,
             max_history=5,
             use_gifs=True,
-            gif_prob=0.3,                 # probability to add a GIF
+            gif_prob=0.30,
             max_message_length=1800,
-            # Loki (accepts base or push URL)
+            # Loki
             loki_url="http://localhost:3100",
             loki_token="",
             # Tenor
             tenor_key="",
             tenor_enabled=True,
-            # Sleep mode (default allow: you)
+            # Sleep mode (allow only specific user)
             sleep_enabled=False,
             sleep_user_id="165548483128983552",
             # Vision
-            vision_provider="openai"      # currently supports 'openai'
+            vision_provider="openai",
         )
 
         self.config.register_user(
@@ -124,9 +120,8 @@ class AprilTalk(commands.Cog):
             custom_smert_prompt="",
         )
 
-    # -----------------------------------
-    # Lifecycle
-    # -----------------------------------
+    # ---------------- Lifecycle ----------------
+
     def cog_unload(self):
         try:
             self.bot.loop.create_task(self.session.close())
@@ -141,9 +136,13 @@ class AprilTalk(commands.Cog):
             finally:
                 self.tts_files.discard(p)
 
-    # -----------------------------------
-    # Helpers: permissions / players
-    # -----------------------------------
+    # ---------------- Small utils ----------------
+
+    def _ctx(self, channel_id: int) -> Dict:
+        if channel_id not in self.ctx_state:
+            self.ctx_state[channel_id] = {"last_subject": None, "last_image_prompt": None}
+        return self.ctx_state[channel_id]
+
     async def _with_limit(self, sem: asyncio.Semaphore, coro):
         async with sem:
             return await coro
@@ -157,7 +156,6 @@ class AprilTalk(commands.Cog):
             allowed_int = int(allowed) if allowed else None
         except Exception:
             allowed_int = None
-        # owner can always manage
         try:
             if await self.bot.is_owner(ctx.author):
                 return True
@@ -165,6 +163,7 @@ class AprilTalk(commands.Cog):
             pass
         return allowed_int is not None and ctx.author.id == allowed_int
 
+    # Voice helpers
     def get_player(self, guild_id: int):
         try:
             return lavalink.get_player(guild_id)
@@ -177,8 +176,8 @@ class AprilTalk(commands.Cog):
         try:
             if hasattr(player, "channel_id"):
                 return bool(player.channel_id)
-            if hasattr(player, "channel"):
-                return bool(player.channel)
+            if hasattr(player, "channel") and player.channel:
+                return True
         except Exception:
             return False
         return False
@@ -193,9 +192,7 @@ class AprilTalk(commands.Cog):
             pass
         return None
 
-    # -----------------------------------
-    # Helpers: Tenor, emotion, style
-    # -----------------------------------
+    # Style & intent
     def style_prompt(self, prompt: str) -> str:
         p = prompt.strip()
         if any(k in p.lower() for k in ["cyberpunk", "synthwave", "futuristic", "sci-fi", "science fiction", "blade runner"]):
@@ -217,13 +214,35 @@ class AprilTalk(commands.Cog):
         ]
         return any(x in t for x in triggers)
 
+    def _looks_like_vague_draw(self, text: str) -> bool:
+        t = text.lower().strip()
+        vague = ["draw it", "draw that", "draw this", "draw one", "draw something"]
+        return any(t.startswith(v) or t == v for v in vague) or (len(t) <= 12 and "draw" in t)
+
     def _extract_draw_text(self, text: str) -> str:
-        # Prefer <draw>...</draw>, otherwise strip leading command-ish tokens
         dp = self.maybe_extract_draw_prompt(text)
         if dp:
             return dp
         t = re.sub(r"^(april\s+)?(draw|/imagine)\s*", "", text.strip(), flags=re.IGNORECASE)
         return t.strip()
+
+    def _looks_like_memory_request(self, text: str) -> bool:
+        t = text.lower()
+        keys = [
+            "search your history", "search my history", "look in your logs",
+            "what did i say", "what did we say", "what did", "remind me when",
+            "find where i said", "from history", "from the logs", "from loki",
+        ]
+        return any(k in t for k in keys)
+
+    async def detect_emotion(self, text: str) -> Optional[str]:
+        t = text.lower()
+        if any(w in t for w in ["happy", "great", "awesome", "excellent", "wonderful", "amazing"]): return "happy"
+        if any(w in t for w in ["think", "consider", "ponder", "wonder", "hmm"]): return "thinking"
+        if any(w in t for w in ["confused", "don't understand", "what", "huh", "unclear"]): return "confused"
+        if any(w in t for w in ["excited", "can't wait", "wow", "amazing!"]): return "excited"
+        if any(w in t for w in ["sad", "sorry", "unfortunately", "regret"]): return "sad"
+        return None
 
     async def _pick_gif(self, emotion: Optional[str]) -> Optional[str]:
         cfg = await self.config.all()
@@ -251,9 +270,7 @@ class AprilTalk(commands.Cog):
                         data = await r.json()
                         results = data.get("results", [])
                         if results:
-                            # pick any mp4/gif url present
                             cand = random.choice(results)
-                            # try the 'gif' field if present, else fallback to any available url
                             media = cand.get("media_formats") or {}
                             for k in ["gif", "tinygif", "nanogif", "mediumgif", "mp4", "tinygifpreview"]:
                                 if k in media and "url" in media[k]:
@@ -261,22 +278,11 @@ class AprilTalk(commands.Cog):
             except Exception as e:
                 log.debug(f"Tenor fetch failed: {e}")
 
-        # fallback list
         arr = FALLBACK_GIFS.get(emotion, [])
         return random.choice(arr) if arr else None
 
-    async def detect_emotion(self, text: str) -> Optional[str]:
-        t = text.lower()
-        if any(w in t for w in ["happy", "great", "awesome", "excellent", "wonderful", "amazing"]): return "happy"
-        if any(w in t for w in ["think", "consider", "ponder", "wonder", "hmm"]): return "thinking"
-        if any(w in t for w in ["confused", "don't understand", "what", "huh", "unclear"]): return "confused"
-        if any(w in t for w in ["excited", "can't wait", "wow", "amazing!"]): return "excited"
-        if any(w in t for w in ["sad", "sorry", "unfortunately", "regret"]): return "sad"
-        return None
+    # ---------------- Loki helpers ----------------
 
-    # -----------------------------------
-    # Helpers: Loki
-    # -----------------------------------
     def _normalize_loki_base(self, configured_url: str) -> str:
         raw = (configured_url or "").rstrip("/")
         if raw.endswith("/loki/api/v1/push"):
@@ -326,9 +332,59 @@ class AprilTalk(commands.Cog):
                 raise RuntimeError(f"Loki {r.status} at {url}: {body}")
             return await r.json()
 
-    # -----------------------------------
-    # Commands
-    # -----------------------------------
+    async def _loki_search_snippets(self, ctx: commands.Context, query_text: str, since: str = "30d", k: int = 20) -> List[Dict]:
+        end_ns = int(time.time() * 1_000_000_000)
+        start_ns = self._since_to_ns(since)
+        terms = [re.escape(w) for w in re.findall(r"[A-Za-z0-9#@._-]+", query_text) if len(w) > 1]
+        regex = "|".join(terms) if terms else "."
+        logql = (
+            f'{{app="discord-bot",event_type="message",guild_id="{ctx.guild.id}",channel_id="{ctx.channel.id}"}} '
+            f'|~ "{regex}" | json'
+        )
+        try:
+            data = await self._with_limit(self._api_sem, self._loki_query_range(logql, start_ns, end_ns, limit=max(50, k)))
+        except Exception:
+            return []
+        rows = []
+        for s in data.get("data", {}).get("result", []):
+            for ts, line in s.get("values", []):
+                try:
+                    obj = json.loads(line)
+                    content = obj.get("content") or ""
+                    author = (obj.get("author") or {}).get("name") or "user"
+                except Exception:
+                    m = re.search(r'"content"\s*:\s*"([^"]*)"', line)
+                    content = m.group(1) if m else line
+                    m2 = re.search(r'"author"\s*:\s*{[^}]*"name"\s*:\s*"([^"]*)"', line)
+                    author = m2.group(1) if m2 else "user"
+                rows.append({"ts": int(ts), "who": author, "text": content})
+        rows.sort(key=lambda r: r["ts"], reverse=True)
+        seen = set()
+        uniq = []
+        for r in rows:
+            key = r["text"].strip().lower()
+            if key and key not in seen:
+                seen.add(key)
+                uniq.append(r)
+            if len(uniq) >= k:
+                break
+        for r in uniq:
+            r["when"] = time.strftime("%Y-%m-%d %H:%M", time.localtime(r["ts"] / 1_000_000_000))
+        return uniq
+
+    async def _summarize_snippets_into_facts(self, user_id: int, snippets: List[Dict], goal: str) -> str:
+        if not snippets:
+            return ""
+        bullet_lines = "\n".join(f"- [{s['when']}] {s['who']}: {s['text']}" for s in snippets[:30])
+        system = {"role": "system", "content": "You turn chat log snippets into 2–5 concise, relevant facts. Prefer concrete details and dates. No fluff."}
+        user = {"role": "user", "content": f"Goal: {goal}\nHere are snippets:\n{bullet_lines}\n\nReturn only the facts as bullets."}
+        try:
+            return await self._with_limit(self._api_sem, self.query_deepseek(user_id, [system, user]))
+        except Exception:
+            return ""
+
+    # ---------------- Commands ----------------
+
     @commands.group(name="april", invoke_without_command=True)
     @commands.cooldown(1, 10, commands.BucketType.user)
     async def april(self, ctx: commands.Context, *, input: str):
@@ -336,21 +392,18 @@ class AprilTalk(commands.Cog):
         if not await self._is_allowed_to_interact(ctx):
             return
 
-        # 1) If the message has image attachments → Vision path
+        # Vision: image attachments
         image_urls = self._collect_image_attachments(ctx.message)
         if image_urls:
             return await self._vision_describe(ctx, image_urls, input)
 
-        # 2) If explicit draw intent → Image path (skip LLM that says "can't draw")
-        if self._is_draw_intent(input):
-            prompt = self._extract_draw_text(input) or input
-            styled = self.style_prompt(prompt)
-            return await self._render_and_send_image(ctx, styled)
+        # Draw routing (context-aware)
+        if self._is_draw_intent(input) or self._looks_like_vague_draw(input):
+            return await self._contextual_draw(ctx, input)
 
-        # 3) Else regular chat
+        # Normal chat
         return await self.process_query(ctx, input)
 
-    # Classic draw subcommand still works
     @april.command(name="draw")
     @commands.cooldown(1, 10, commands.BucketType.user)
     async def april_draw(self, ctx: commands.Context, *, prompt: str):
@@ -362,7 +415,18 @@ class AprilTalk(commands.Cog):
         styled = self.style_prompt(p)
         await self._render_and_send_image(ctx, styled)
 
-    # Sleep controls (owner)
+    @april.command(name="again")
+    async def april_draw_again(self, ctx: commands.Context, *, tweak: str = ""):
+        """Re-render the last image with a tweak, e.g. `.april again but darker`"""
+        ctxobj = self._ctx(ctx.channel.id)
+        last = ctxobj.get("last_image_prompt")
+        if not last:
+            return await ctx.send("I don’t have a previous image prompt in this channel yet.")
+        styled = self.style_prompt((last + " " + tweak).strip())
+        ctxobj["last_image_prompt"] = styled
+        return await self._render_and_send_image(ctx, styled, prefix="again:")
+
+    # Sleep controls
     @april.command(name="sleep")
     @commands.is_owner()
     async def april_sleep(self, ctx: commands.Context, enabled: bool):
@@ -377,7 +441,7 @@ class AprilTalk(commands.Cog):
         await self.config.sleep_user_id.set(str(uid))
         await ctx.send(f"🔒 Allowed user set to <@{uid}>.")
 
-    # Loki config (owner) – also mirrored under .aprilcfg
+    # Loki controls mirrored here
     @april.command(name="lokiurl")
     @commands.is_owner()
     async def lokiurl_cmd(self, ctx: commands.Context, url: str):
@@ -448,7 +512,6 @@ class AprilTalk(commands.Cog):
             user_id=uid,
             user_name=uname if not uid else None,
         )
-
         try:
             async with ctx.typing():
                 data = await self._with_limit(self._api_sem, self._loki_query_range(logql, start_ns, end_ns, limit))
@@ -499,7 +562,28 @@ class AprilTalk(commands.Cog):
         except Exception as e:
             await ctx.send(f"⚠️ Loki query failed: `{e}`")
 
-    # Voice helpers
+    @april.command(name="recall")
+    async def april_recall(self, ctx: commands.Context, *, query: str = "interesting fact  OR plan OR todo"):
+        """
+        Mine the channel’s Loki history for highlights and summarize them.
+        Usage: .april recall beefy haggis ; .april recall deploy plan
+        """
+        try:
+            async with ctx.typing():
+                snippets = await self._loki_search_snippets(ctx, query, since="365d", k=30)
+                if not snippets:
+                    return await ctx.send("🔎 Nothing relevant found in history.")
+                facts = await self._summarize_snippets_into_facts(ctx.author.id, snippets, goal=f"Summarize highlights for: {query}")
+                if not facts:
+                    return await ctx.send("I found entries, but couldn’t summarize them right now.")
+                for page in pagify(facts, page_length=1800):
+                    await ctx.send(page)
+                # seed the subject so follow-up "draw it" has context
+                self._ctx(ctx.channel.id)["last_subject"] = query
+        except Exception as e:
+            await ctx.send(f"⚠️ recall failed: `{e}`")
+
+    # Voice
     @april.command(name="join")
     async def join_voice(self, ctx: commands.Context):
         if not await self._is_allowed_to_interact(ctx):
@@ -568,9 +652,8 @@ class AprilTalk(commands.Cog):
             await user_cfg.smert_mode.set(False)
             await ctx.send("💡 Smert mode OFF.")
 
-    # -----------------------------------
-    # Chat flow
-    # -----------------------------------
+    # ---------------- Chat flow ----------------
+
     async def process_query(self, ctx: commands.Context, input_text: str):
         use_voice = False
         if await self.config.tts_enabled():
@@ -593,7 +676,16 @@ class AprilTalk(commands.Cog):
                 system_prompt = (await self.config.smert_prompt()) if smert_mode else (await self.config.system_prompt())
                 messages = [{"role": "system", "content": system_prompt}]
 
-                # inject recall
+                # Loki RAG injection if asked
+                loki_context_text = ""
+                if self._looks_like_memory_request(input_text):
+                    topic = re.sub(r"^(april|hey|hi|please|can you)\s+", "", input_text, flags=re.I).strip()
+                    snippets = await self._loki_search_snippets(ctx, topic or "interesting|fact|todo|plan", since="365d", k=30)
+                    loki_context_text = await self._summarize_snippets_into_facts(ctx.author.id, snippets, goal="Provide an interesting, relevant fact this user might care about.")
+                    if loki_context_text:
+                        messages.append({"role": "system", "content": f"[history-facts]\n{loki_context_text}"})
+
+                # inject cached recall (manual fetch) if present
                 ch_recall = self.recall.get(ch, {})
                 if ch_recall:
                     mems = []
@@ -619,16 +711,21 @@ class AprilTalk(commands.Cog):
                 self.history[ch].append({"role": "user", "content": input_text})
                 self.history[ch].append({"role": "assistant", "content": clean})
 
+                # Update conversational subject (cheap heuristic)
+                ctxobj = self._ctx(ch)
+                m = re.search(r"([A-Z][^.!?\n]{5,60})", clean)
+                if m:
+                    ctxobj["last_subject"] = m.group(1).strip()
+
                 tasks = []
                 if not (use_voice and not await self.config.text_response_when_voice()):
                     tasks.append(asyncio.create_task(self.send_streamed_response(ctx, clean)))
                 if use_voice:
                     tasks.append(asyncio.create_task(self.speak_response(ctx, clean)))
-
                 if draw_prompt:
                     styled = self.style_prompt(draw_prompt)
+                    ctxobj["last_image_prompt"] = styled
                     tasks.append(asyncio.create_task(self._render_and_send_image(ctx, styled, prefix="pic related:")))
-
                 if tasks:
                     await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -641,7 +738,6 @@ class AprilTalk(commands.Cog):
         gif_url = await self._pick_gif(emotion)
 
         if len(resp) > max_len:
-            # chunk by message length
             words = resp.split()
             chunks, cur, cur_len = [], [], 0
             for w in words:
@@ -671,9 +767,8 @@ class AprilTalk(commands.Cog):
                 await asyncio.sleep(delay)
             await msg.edit(content=resp + (f"\n{gif_url}" if gif_url else ""), embed=None)
 
-    # -----------------------------------
-    # TTS / Images / Models / Vision
-    # -----------------------------------
+    # ---------------- TTS / Images / Models / Vision ----------------
+
     def clean_text_for_tts(self, text: str) -> str:
         text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
         text = re.sub(r'\*(.*?)\*', r'\1', text)
@@ -756,7 +851,6 @@ class AprilTalk(commands.Cog):
             return data["choices"][0]["message"]["content"].strip()
 
     async def query_anthropic(self, user_id: int, messages: list) -> str:
-        # prefer user key if provided
         user = self.bot.get_user(user_id)
         if user:
             custom = await self.config.user(user).custom_anthropic_key()
@@ -787,20 +881,18 @@ class AprilTalk(commands.Cog):
             data = await r.json()
             return data["content"][0]["text"].strip()
 
-    # ----- Vision intake (OpenAI)
+    # Vision intake
     def _collect_image_attachments(self, message: discord.Message) -> List[str]:
         urls = []
         for att in message.attachments:
             if att.content_type and att.content_type.startswith("image/"):
                 urls.append(att.url)
             else:
-                # heuristic: filenames
                 if any(att.filename.lower().endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".gif", ".webp")):
                     urls.append(att.url)
         return urls
 
     async def _vision_describe(self, ctx: commands.Context, image_urls: List[str], user_text: str):
-        # Only OpenAI vision for now
         provider = (await self.config.vision_provider()) or "openai"
         if provider != "openai":
             return await ctx.send("⚠️ Vision provider not supported yet. Set `[p]aprilcfg vision openai`.")
@@ -808,7 +900,6 @@ class AprilTalk(commands.Cog):
         if not key:
             return await ctx.send("⚠️ Set an OpenAI key first: `[p]aprilcfg openaikey <key>`")
 
-        # Build OpenAI chat-completions style vision prompt
         messages = [
             {"role": "system", "content": "You are April, a helpful AI assistant. Briefly and helpfully describe the image(s), then answer the user's question if any. Be concise and kind."},
             {
@@ -819,11 +910,7 @@ class AprilTalk(commands.Cog):
             }
         ]
         model = "gpt-4o-mini"
-
-        headers = {
-            "Authorization": f"Bearer {key}",
-            "Content-Type": "application/json",
-        }
+        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
         payload = {"model": model, "messages": messages, "max_tokens": 600}
         try:
             async with ctx.typing():
@@ -837,6 +924,48 @@ class AprilTalk(commands.Cog):
         except Exception as e:
             await ctx.send(f"❌ Vision failed: {e}")
 
+    async def _contextual_draw(self, ctx: commands.Context, user_text: str):
+        """Builds an image prompt from last subject, user text, and (optional) Loki snippets."""
+        ch = ctx.channel.id
+        ctxobj = self._ctx(ch)
+        last_subject = ctxobj.get("last_subject") or ""
+
+        explicit = self.maybe_extract_draw_prompt(user_text)
+        raw_user_prompt = explicit or self._extract_draw_text(user_text)
+
+        loki_bullets = ""
+        if "history" in user_text.lower() or "from loki" in user_text.lower():
+            snippets = await self._loki_search_snippets(ctx, raw_user_prompt or last_subject or "topic", since="365d", k=20)
+            loki_bullets = await self._summarize_snippets_into_facts(ctx.author.id, snippets, goal="Provide visual details to include in an illustration prompt.")
+
+        context_lines = []
+        if last_subject:
+            context_lines.append(f"Conversation subject: {last_subject}")
+        if raw_user_prompt:
+            context_lines.append(f"User wants: {raw_user_prompt}")
+        if loki_bullets:
+            context_lines.append(f"Relevant history facts:\n{loki_bullets}")
+
+        crafter_sys = {
+            "role": "system",
+            "content": (
+                "You write exactly ONE single-line image prompt for a text-to-image model. "
+                "Use the given conversation subject and facts. Be concrete and vivid. "
+                "No quotes, no commentary. 30 words max."
+            )
+        }
+        crafter_user = {"role": "user", "content": "\n".join(context_lines) or "Create an evocative image prompt from recent conversation."}
+
+        try:
+            crafted = await self._with_limit(self._api_sem, self.query_deepseek(ctx.author.id, [crafter_sys, crafter_user]))
+        except Exception:
+            base = raw_user_prompt or last_subject or "the current topic"
+            crafted = f"{base} in a detailed illustrative scene"
+
+        styled = self.style_prompt(re.sub(r"\s+", " ", crafted).strip())
+        ctxobj["last_image_prompt"] = styled
+        return await self._render_and_send_image(ctx, styled, prefix="pic related:")
+
     async def _render_and_send_image(self, ctx: commands.Context, styled_prompt: str, prefix: Optional[str] = None):
         try:
             async with ctx.typing():
@@ -848,35 +977,8 @@ class AprilTalk(commands.Cog):
         except Exception as e:
             await ctx.send(f"⚠️ Image failed: `{e}`")
 
-    # -----------------------------------
-    # Fun flow
-    # -----------------------------------
-    async def _draw_what_you_think(self, ctx: commands.Context):
-        # Use chat to make the *caption*, but we always render an image regardless,
-        # so DeepSeek never blocks drawing.
-        async with ctx.typing():
-            try:
-                ch = ctx.channel.id
-                if ch not in self.history:
-                    max_hist = await self.config.max_history()
-                    self.history[ch] = deque(maxlen=max_hist * 2)
-                system_prompt = await self.config.system_prompt()
-                messages = [{"role": "system", "content": system_prompt}]
-                messages.extend(self.history[ch])
-                messages.append({"role": "user", "content": "User: I know what you're thinking, draw me it!"})
-                caption = await self._with_limit(self._api_sem, self.query_deepseek(ctx.author.id, messages))
-                # craft a simple prompt by appending style
-                img_prompt = self.style_prompt("abstract representation of what you're thinking right now")
-                png = await self._with_limit(self._api_sem, self.generate_openai_image_png(img_prompt, size="1024x1024"))
-                await ctx.send(file=discord.File(BytesIO(png), filename="april_draw.png"), content=f"{caption}\n\n**Image:** {img_prompt}")
-                self.history[ch].append({"role": "user", "content": "I know what you're thinking, draw me it!"})
-                self.history[ch].append({"role": "assistant", "content": caption + f"\n[Image: {img_prompt}]"})
-            except Exception as e:
-                await ctx.send(f"⚠️ Couldn't complete the draw-what-you-think flow: `{e}`")
+    # ---------------- Config group (.aprilcfg) ----------------
 
-    # -----------------------------------
-    # Config group (classic .aprilcfg)
-    # -----------------------------------
     @commands.group(name="aprilconfig", aliases=["aprilcfg"])
     @commands.is_owner()
     async def aprilconfig(self, ctx: commands.Context):
@@ -884,7 +986,6 @@ class AprilTalk(commands.Cog):
         if ctx.invoked_subcommand is None:
             await self.show_settings(ctx)
 
-    # API keys & model knobs — plain confirmation
     @aprilconfig.command()
     async def deepseekkey(self, ctx: commands.Context, key: str):
         await self.config.deepseek_key.set(key)
@@ -972,7 +1073,6 @@ class AprilTalk(commands.Cog):
         else:
             await ctx.send("❌ Value must be between 0 and 1")
 
-    # Tenor controls
     @aprilconfig.command(name="tenorkey")
     async def cfg_tenorkey(self, ctx: commands.Context, key: str):
         await self.config.tenor_key.set(key)
@@ -985,7 +1085,6 @@ class AprilTalk(commands.Cog):
         await self.config.tenor_enabled.set(bool(enabled))
         await ctx.send(f"✅ Tenor {'enabled' if enabled else 'disabled'}")
 
-    # Vision provider
     @aprilconfig.command(name="vision")
     async def cfg_vision(self, ctx: commands.Context, provider: str):
         provider = provider.lower().strip()
@@ -994,7 +1093,6 @@ class AprilTalk(commands.Cog):
         await self.config.vision_provider.set(provider)
         await ctx.send(f"✅ Vision provider set to `{provider}`")
 
-    # Loki in .aprilcfg as well
     @aprilconfig.command(name="lokiurl")
     async def cfg_lokiurl(self, ctx: commands.Context, url: str):
         await self.config.loki_url.set(url.rstrip("/"))
@@ -1009,7 +1107,6 @@ class AprilTalk(commands.Cog):
     async def cfg_lokiverify(self, ctx: commands.Context):
         await self.lokiverify_cmd(ctx)
 
-    # Sleep in .aprilcfg
     @aprilconfig.command(name="sleep")
     async def cfg_sleep(self, ctx: commands.Context, enabled: bool):
         await self.config.sleep_enabled.set(bool(enabled))
@@ -1042,7 +1139,6 @@ class AprilTalk(commands.Cog):
         e.add_field(name="Max Message Length", value=f"`{cfg['max_message_length']}`", inline=True)
         e.add_field(name="TTS Enabled", value="✅" if cfg['tts_enabled'] else "❌", inline=True)
         e.add_field(name="Text with Voice", value="✅" if cfg['text_response_when_voice'] else "❌", inline=True)
-        e.add_field(name="Emotion GIFs", value="✅" if cfg['use_gifs'] else "❌", inline=True)
         e.add_field(name="Loki URL", value=f"{cfg.get('loki_url','')}", inline=False)
         e.add_field(name="Sleep Mode", value="😴 ON" if cfg.get("sleep_enabled") else "💬 OFF", inline=True)
         e.add_field(name="Sleep Allowed User", value=f"<@{cfg.get('sleep_user_id','')}>" if cfg.get("sleep_user_id") else "—", inline=True)
