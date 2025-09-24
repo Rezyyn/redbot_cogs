@@ -9,6 +9,7 @@ import time
 import base64
 import re
 import json
+from datetime import timezone, datetime
 from collections import deque
 from pathlib import Path
 from io import BytesIO
@@ -64,9 +65,9 @@ class AprilTalk(commands.Cog):
         self.session = aiohttp.ClientSession()
 
         # Memory
-        self.history: Dict[int, deque] = {}  # channel_id -> deque of chat messages
+        self.history: Dict[int, deque] = {}              # channel_id -> deque of chat messages
         self.recall: Dict[int, Dict[str, List[str]]] = {}  # channel_id -> {user: [lines]}
-        self.ctx_state: Dict[int, Dict] = {}  # channel_id -> {"last_subject": str, "last_image_prompt": str}
+        self.ctx_state: Dict[int, Dict] = {}             # channel_id -> {"last_subject": str, "last_image_prompt": str}
 
         # Concurrency
         self._api_sem = asyncio.Semaphore(3)
@@ -97,9 +98,12 @@ class AprilTalk(commands.Cog):
             use_gifs=True,
             gif_prob=0.30,
             max_message_length=1800,
-            # Loki
+            # Loki (query)
             loki_url="http://localhost:3100",
             loki_token="",
+            # Loki (push)
+            loki_push_url="http://localhost:3100/loki/api/v1/push",
+            loki_push_enabled=True,
             # Tenor
             tenor_key="",
             tenor_enabled=True,
@@ -277,7 +281,7 @@ class AprilTalk(commands.Cog):
         arr = FALLBACK_GIFS.get(emotion, [])
         return random.choice(arr) if arr else None
 
-    # ---------------- Loki ----------------
+    # ---------------- Loki: query/push ----------------
 
     def _normalize_loki_base(self, configured_url: str) -> str:
         raw = (configured_url or "").rstrip("/")
@@ -300,21 +304,30 @@ class AprilTalk(commands.Cog):
             return str(uid), (user.name if user else None)
         return None, mention.lstrip("@")
 
+    def _escape_regex(self, s: str) -> str:
+        return re.sub(r'([.^$*+?{}\[\]\\|()])', r'\\\1', s)
+
     def _build_logql_for_user(self, *, guild_id: int, channel_id: int, user_id: Optional[str], user_name: Optional[str]) -> str:
         base = f'{{app="discord-bot",event_type="message",guild_id="{guild_id}",channel_id="{channel_id}"}} | json'
         if user_id:
-            return base + f' | author.id="{user_id}"'
+            return base + f' | author_id = "{user_id}"'
         if user_name:
-            return base + f' | author.name="{user_name}"'
+            safe = self._escape_regex(user_name)
+            return base + f' | author_name =~ "^{safe}$"'
         return base
+
+    async def _get_loki_headers(self):
+        headers = {"Content-Type": "application/json"}
+        token = await self.config.loki_token()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        return headers
 
     async def _loki_query_range(self, query: str, start_ns: int, end_ns: int, limit: int = 50):
         cfg = await self.config.all()
         base = self._normalize_loki_base(cfg.get("loki_url", ""))
         url = f"{base}/loki/api/v1/query_range"
-        headers = {}
-        if cfg.get("loki_token"):
-            headers["Authorization"] = f"Bearer {cfg['loki_token']}"
+        headers = await self._get_loki_headers()
         params = {
             "query": query,
             "start": str(start_ns),
@@ -327,6 +340,22 @@ class AprilTalk(commands.Cog):
                 body = await r.text()
                 raise RuntimeError(f"Loki {r.status} at {url}: {body}")
             return await r.json()
+
+    async def _loki_push(self, streams):
+        if not await self.config.loki_push_enabled():
+            return
+        push_url = await self.config.loki_push_url()
+        if not push_url:
+            return
+        headers = await self._get_loki_headers()
+        payload = {"streams": streams}
+        try:
+            async with self.session.post(push_url, json=payload, headers=headers, timeout=20) as r:
+                if r.status != 204:
+                    body = await r.text()
+                    log.warning(f"Loki push {r.status}: {body}")
+        except Exception as e:
+            log.warning(f"Loki push failed: {e}")
 
     async def _loki_search_snippets(self, ctx: commands.Context, query_text: str, since: str = "30d", k: int = 20) -> List[Dict]:
         end_ns = int(time.time() * 1_000_000_000)
@@ -379,6 +408,104 @@ class AprilTalk(commands.Cog):
         except Exception:
             return ""
 
+    # ---------------- Live push listeners ----------------
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        if message.author.bot:
+            return
+        if not await self.config.loki_push_enabled():
+            return
+        ns_timestamp = str(int(message.created_at.replace(tzinfo=timezone.utc).timestamp() * 1e9))
+        message_data = {
+            "content": message.content,
+            "message_id": str(message.id),
+            "author": {
+                "id": str(message.author.id),
+                "name": message.author.name,
+                "discriminator": message.author.discriminator,
+                "bot": message.author.bot,
+                "avatar": str(message.author.avatar.url) if message.author.avatar and message.author.avatar.url else None
+            },
+            "channel": {
+                "id": str(message.channel.id),
+                "name": message.channel.name if hasattr(message.channel, "name") else "DM",
+                "category": message.channel.category.name if hasattr(message.channel, "category") and message.channel.category else None
+            },
+            "guild": {
+                "id": str(message.guild.id),
+                "name": message.guild.name
+            } if message.guild else None,
+            "created_at": message.created_at.isoformat(),
+            "attachments": [{
+                "url": a.url,
+                "filename": a.filename,
+                "size": a.size,
+                "content_type": a.content_type
+            } for a in message.attachments],
+            "embeds": [{
+                "type": e.type,
+                "title": e.title,
+                "description": e.description
+            } for e in message.embeds]
+        }
+        stream_labels = {
+            "app": "discord-bot",
+            "event_type": "message",
+            "channel_id": str(message.channel.id),
+            "guild_id": str(message.guild.id) if message.guild else "DM",
+            "source": "april"
+        }
+        await self._loki_push([{"stream": stream_labels, "values": [[ns_timestamp, json.dumps(message_data)]]}])
+
+    @commands.Cog.listener())
+    async def on_message_edit(self, before: discord.Message, after: discord.Message):
+        if after.author.bot or not await self.config.loki_push_enabled():
+            return
+        ns = str(int((after.edited_at or after.created_at).replace(tzinfo=timezone.utc).timestamp() * 1e9))
+        edit_data = {
+            "event_type": "edit",
+            "message_id": str(after.id),
+            "channel_id": str(after.channel.id),
+            "guild_id": str(after.guild.id) if after.guild else "DM",
+            "author_id": str(after.author.id),
+            "old_content": before.content,
+            "new_content": after.content,
+            "edited_at": after.edited_at.isoformat() if after.edited_at else None
+        }
+        labels = {
+            "app": "discord-bot",
+            "event_type": "edit",
+            "channel_id": str(after.channel.id),
+            "guild_id": str(after.guild.id) if after.guild else "DM",
+            "source": "april"
+        }
+        await self._loki_push([{"stream": labels, "values": [[ns, json.dumps(edit_data)]]}])
+
+    @commands.Cog.listener()
+    async def on_message_delete(self, message: discord.Message):
+        if message.author.bot or not await self.config.loki_push_enabled():
+            return
+        ns = str(int(time.time() * 1e9))
+        delete_data = {
+            "event_type": "delete",
+            "message_id": str(message.id),
+            "channel_id": str(message.channel.id),
+            "guild_id": str(message.guild.id) if message.guild else "DM",
+            "author_id": str(message.author.id),
+            "content": message.content,
+            "created_at": message.created_at.isoformat(),
+            "deleted_at": datetime.now(timezone.utc).isoformat()
+        }
+        labels = {
+            "app": "discord-bot",
+            "event_type": "delete",
+            "channel_id": str(message.channel.id),
+            "guild_id": str(message.guild.id) if message.guild else "DM",
+            "source": "april"
+        }
+        await self._loki_push([{"stream": labels, "values": [[ns, json.dumps(delete_data)]]}])
+
     # ---------------- Commands ----------------
 
     @commands.group(name="april", invoke_without_command=True)
@@ -396,7 +523,6 @@ class AprilTalk(commands.Cog):
         if self._is_draw_intent(input) or self._looks_like_vague_draw(input):
             return await self._contextual_draw(ctx, input)
 
-        # Normal chat
         return await self.process_query(ctx, input)
 
     @april.command(name="draw")
@@ -447,14 +573,24 @@ class AprilTalk(commands.Cog):
         await self.config.loki_token.set(token)
         await ctx.send("✅ Loki token set")
 
+    @april.command(name="lokipush")
+    @commands.is_owner()
+    async def lokipush_cmd(self, ctx: commands.Context, url: str):
+        await self.config.loki_push_url.set(url)
+        await ctx.send(f"✅ Loki push URL set to `{url}`")
+
+    @april.command(name="lokipushon")
+    @commands.is_owner()
+    async def lokipushon_cmd(self, ctx: commands.Context, enabled: bool):
+        await self.config.loki_push_enabled.set(bool(enabled))
+        await ctx.send(f"✅ Loki live logging {'ENABLED' if enabled else 'DISABLED'}")
+
     @april.command(name="lokiverify")
     @commands.is_owner()
     async def lokiverify_cmd(self, ctx: commands.Context):
         cfg = await self.config.all()
         base = self._normalize_loki_base(cfg.get("loki_url", ""))
-        headers = {}
-        if cfg.get("loki_token"):
-            headers["Authorization"] = f"Bearer {cfg['loki_token']}"
+        headers = await self._get_loki_headers()
         ready_url = f"{base}/ready"
         labels_url = f"{base}/loki/api/v1/labels"
         query_url = f"{base}/loki/api/v1/query"
@@ -497,6 +633,15 @@ class AprilTalk(commands.Cog):
             async with ctx.typing():
                 data = await self._with_limit(self._api_sem, self._loki_query_range(logql, start_ns, end_ns, limit))
                 streams = data.get("data", {}).get("result", [])
+                if not streams:
+                    # fallback to simple substring on raw line
+                    q = (
+                        f'{{app="discord-bot",event_type="message",guild_id="{ctx.guild.id}",channel_id="{ctx.channel.id}"}}'
+                        f' |= "{uid or uname}"'
+                    )
+                    data = await self._with_limit(self._api_sem, self._loki_query_range(q, start_ns, end_ns, limit))
+                    streams = data.get("data", {}).get("result", [])
+
                 if not streams:
                     return await ctx.send(f"🔎 No logs for {user_mention} in last {since}.")
 
@@ -653,7 +798,6 @@ class AprilTalk(commands.Cog):
                 messages = [{"role": "system", "content": system_prompt}]
 
                 # Loki RAG injection if asked
-                loki_context_text = ""
                 if self._looks_like_memory_request(input_text):
                     topic = re.sub(r"^(april|hey|hi|please|can you)\s+", "", input_text, flags=re.I).strip()
                     snippets = await self._loki_search_snippets(ctx, topic or "interesting|fact|todo|plan", since="365d", k=30)
@@ -661,7 +805,7 @@ class AprilTalk(commands.Cog):
                     if loki_context_text:
                         messages.append({"role": "system", "content": f"[history-facts]\n{loki_context_text}"})
 
-                # inject cached manual recall if present
+                # inject cached recall if present
                 ch_recall = self.recall.get(ch, {})
                 if ch_recall:
                     mems = []
@@ -884,9 +1028,7 @@ class AprilTalk(commands.Cog):
             {"role": "system", "content": "You are April, a helpful AI assistant. Briefly and helpfully describe the image(s), then answer the user's question if any. Be concise and kind."},
             {
                 "role": "user",
-                "content": [
-                    {"type": "text", "text": user_text or "Describe the image."},
-                ] + [{"type": "image_url", "image_url": {"url": u}} for u in image_urls]
+                "content": [{"type": "text", "text": user_text or "Describe the image."}] + [{"type": "image_url", "image_url": {"url": u}} for u in image_urls]
             }
         ]
         model = "gpt-4o-mini"
@@ -1081,20 +1223,19 @@ class AprilTalk(commands.Cog):
         await self.config.loki_token.set(token)
         await ctx.send("✅ Loki token set")
 
+    @aprilconfig.command(name="lokipush")
+    async def cfg_lokipush(self, ctx: commands.Context, url: str):
+        await self.config.loki_push_url.set(url)
+        await ctx.send(f"✅ Loki push URL set to `{url}`")
+
+    @aprilconfig.command(name="lokipushon")
+    async def cfg_lokipushon(self, ctx: commands.Context, enabled: bool):
+        await self.config.loki_push_enabled.set(bool(enabled))
+        await ctx.send(f"✅ Loki live logging {'ENABLED' if enabled else 'DISABLED'}")
+
     @aprilconfig.command(name="lokiverify")
     async def cfg_lokiverify(self, ctx: commands.Context):
         await self.lokiverify_cmd(ctx)
-
-    @aprilconfig.command(name="sleep")
-    async def cfg_sleep(self, ctx: commands.Context, enabled: bool):
-        await self.config.sleep_enabled.set(bool(enabled))
-        await ctx.send(f"✅ Sleep mode {'ON' if enabled else 'OFF'}.")
-
-    @aprilconfig.command(name="sleepuser")
-    async def cfg_sleepuser(self, ctx: commands.Context, user_id: Optional[int] = None):
-        uid = user_id or ctx.author.id
-        await self.config.sleep_user_id.set(str(uid))
-        await ctx.send(f"🔒 Allowed user set to <@{uid}>.")
 
     @aprilconfig.command(name="settings")
     async def show_settings(self, ctx: commands.Context):
@@ -1118,6 +1259,8 @@ class AprilTalk(commands.Cog):
         e.add_field(name="TTS Enabled", value="✅" if cfg['tts_enabled'] else "❌", inline=True)
         e.add_field(name="Text with Voice", value="✅" if cfg['text_response_when_voice'] else "❌", inline=True)
         e.add_field(name="Loki URL", value=f"{cfg.get('loki_url','')}", inline=False)
+        e.add_field(name="Loki Push URL", value=f"{cfg.get('loki_push_url','')}", inline=False)
+        e.add_field(name="Loki Push Enabled", value="✅" if cfg.get("loki_push_enabled") else "❌", inline=True)
         e.add_field(name="Sleep Mode", value="😴 ON" if cfg.get("sleep_enabled") else "💬 OFF", inline=True)
         e.add_field(name="Sleep Allowed User", value=f"<@{cfg.get('sleep_user_id','')}>" if cfg.get("sleep_user_id") else "—", inline=True)
         sp = cfg['system_prompt'][:200] + ("..." if len(cfg['system_prompt']) > 200 else "")
@@ -1125,6 +1268,26 @@ class AprilTalk(commands.Cog):
         e.add_field(name="System Prompt", value=f"```{sp}```", inline=False)
         e.add_field(name="Smert Prompt", value=f"```{sm}```", inline=False)
         await ctx.send(embed=e)
+
+    # ---------------- Voice events ----------------
+
+    @commands.Cog.listener()
+    async def on_voice_state_update(self, member, before, after):
+        if member.bot:
+            return
+        try:
+            player = self.get_player(member.guild.id)
+            if player and self.is_player_connected(player):
+                channel_id = self.get_player_channel_id(player)
+                if channel_id:
+                    voice_channel = self.bot.get_channel(channel_id)
+                    if voice_channel:
+                        human_members = [m for m in voice_channel.members if not m.bot]
+                        if len(human_members) == 0:
+                            await player.disconnect()
+                            log.debug(f"Left voice in {member.guild} (empty channel)")
+        except Exception as e:
+            log.error(f"Error handling voice state update: {e}")
 
 
 async def setup(bot: Red):
