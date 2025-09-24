@@ -65,15 +65,20 @@ class AprilTalk(commands.Cog):
         self.session = aiohttp.ClientSession()
 
         # Memory
-        self.history: Dict[int, deque] = {}              # channel_id -> deque of chat messages
-        self.recall: Dict[int, Dict[str, List[str]]] = {}  # channel_id -> {user: [lines]}
-        self.ctx_state: Dict[int, Dict] = {}             # channel_id -> {"last_subject": str, "last_image_prompt": str}
+        self.history: Dict[int, deque] = {}                 # channel_id -> deque of chat messages
+        self.recall: Dict[int, Dict[str, List[str]]] = {}   # channel_id -> {user: [lines]}
+        self.ctx_state: Dict[int, Dict] = {}                # channel_id -> {"last_subject": str, "last_image_prompt": str}
+
+        # Secret short-term memory (from Loki)
+        # channel_id -> { user_id: {"ts": int, "lines": [str], "fetched_at": float} }
+        self.short_mem: Dict[int, Dict[int, Dict]] = {}
+        self._short_mem_ttl = 20.0
 
         # Concurrency
         self._api_sem = asyncio.Semaphore(3)
         self._tts_sem = asyncio.Semaphore(1)
-        self._edit_delay = 0.03
-        self._chunk_size = 180
+        self._edit_delay = 0.05
+        self._chunk_size = 240
 
         # TTS files
         self.tts_dir = Path(cog_data_path(self)) / "tts"
@@ -316,6 +321,12 @@ class AprilTalk(commands.Cog):
             return base + f' | author_name =~ "^{safe}$"'
         return base
 
+    def _build_recent_user_logql(self, guild_id: int, channel_id: int, user_id: int) -> str:
+        return (
+            f'{{app="discord-bot",event_type="message",guild_id="{guild_id}",channel_id="{channel_id}"}} '
+            f'| json | author_id = "{user_id}"'
+        )
+
     async def _get_loki_headers(self):
         headers = {"Content-Type": "application/json"}
         token = await self.config.loki_token()
@@ -408,55 +419,107 @@ class AprilTalk(commands.Cog):
         except Exception:
             return ""
 
+    async def _prefetch_recent_user_history(self, guild_id: int, channel_id: int, user_id: int, max_items: int) -> List[str]:
+        ch_map = self.short_mem.setdefault(channel_id, {})
+        now = time.time()
+        cached = ch_map.get(user_id)
+        if cached and now - cached.get("fetched_at", 0) <= self._short_mem_ttl:
+            return cached.get("lines", [])
+
+        end_ns = int(time.time() * 1_000_000_000)
+        start_ns = end_ns - 30 * 24 * 3600 * 1_000_000_000
+        logql = self._build_recent_user_logql(guild_id, channel_id, user_id)
+
+        try:
+            data = await self._with_limit(self._api_sem, self._loki_query_range(logql, start_ns, end_ns, limit=max_items))
+        except Exception:
+            ch_map[user_id] = {"lines": [], "fetched_at": now}
+            return []
+
+        rows = []
+        for s in data.get("data", {}).get("result", []):
+            for ts, line in s.get("values", []):
+                try:
+                    obj = json.loads(line)
+                    text = obj.get("content") or ""
+                except Exception:
+                    m = re.search(r'"content"\s*:\s*"([^"]*)"', line)
+                    text = m.group(1) if m else line
+                if text:
+                    rows.append((int(ts), text))
+
+        rows.sort(key=lambda x: x[0], reverse=True)
+        lines = [t for _, t in rows[:max_items]]
+        lines.reverse()
+
+        ch_map[user_id] = {"lines": lines, "fetched_at": now}
+        return lines
+
     # ---------------- Live push listeners ----------------
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         if message.author.bot:
             return
-        if not await self.config.loki_push_enabled():
-            return
-        ns_timestamp = str(int(message.created_at.replace(tzinfo=timezone.utc).timestamp() * 1e9))
-        message_data = {
-            "content": message.content,
-            "message_id": str(message.id),
-            "author": {
-                "id": str(message.author.id),
-                "name": message.author.name,
-                "discriminator": message.author.discriminator,
-                "bot": message.author.bot,
-                "avatar": str(message.author.avatar.url) if message.author.avatar and message.author.avatar.url else None
-            },
-            "channel": {
-                "id": str(message.channel.id),
-                "name": message.channel.name if hasattr(message.channel, "name") else "DM",
-                "category": message.channel.category.name if hasattr(message.channel, "category") and message.channel.category else None
-            },
-            "guild": {
-                "id": str(message.guild.id),
-                "name": message.guild.name
-            } if message.guild else None,
-            "created_at": message.created_at.isoformat(),
-            "attachments": [{
-                "url": a.url,
-                "filename": a.filename,
-                "size": a.size,
-                "content_type": a.content_type
-            } for a in message.attachments],
-            "embeds": [{
-                "type": e.type,
-                "title": e.title,
-                "description": e.description
-            } for e in message.embeds]
-        }
-        stream_labels = {
-            "app": "discord-bot",
-            "event_type": "message",
-            "channel_id": str(message.channel.id),
-            "guild_id": str(message.guild.id) if message.guild else "DM",
-            "source": "april"
-        }
-        await self._loki_push([{"stream": stream_labels, "values": [[ns_timestamp, json.dumps(message_data)]]}])
+
+        # Push to Loki
+        if await self.config.loki_push_enabled():
+            ns_timestamp = str(int(message.created_at.replace(tzinfo=timezone.utc).timestamp() * 1e9))
+            message_data = {
+                "content": message.content,
+                "message_id": str(message.id),
+                "author": {
+                    "id": str(message.author.id),
+                    "name": message.author.name,
+                    "discriminator": message.author.discriminator,
+                    "bot": message.author.bot,
+                    "avatar": str(message.author.avatar.url) if message.author.avatar and message.author.avatar.url else None
+                },
+                "channel": {
+                    "id": str(message.channel.id),
+                    "name": message.channel.name if hasattr(message.channel, "name") else "DM",
+                    "category": message.channel.category.name if hasattr(message.channel, "category") and message.channel.category else None
+                },
+                "guild": {
+                    "id": str(message.guild.id),
+                    "name": message.guild.name
+                } if message.guild else None,
+                "created_at": message.created_at.isoformat(),
+                "attachments": [{
+                    "url": a.url,
+                    "filename": a.filename,
+                    "size": a.size,
+                    "content_type": a.content_type
+                } for a in message.attachments],
+                    "embeds": [{
+                    "type": e.type,
+                    "title": e.title,
+                    "description": e.description
+                } for e in message.embeds]
+            }
+            stream_labels = {
+                "app": "discord-bot",
+                "event_type": "message",
+                "channel_id": str(message.channel.id),
+                "guild_id": str(message.guild.id) if message.guild else "DM",
+                "source": "april"
+            }
+            asyncio.create_task(self._loki_push([{"stream": stream_labels, "values": [[ns_timestamp, json.dumps(message_data)]]}]))
+
+        # Secretly prewarm short-term memory for this speaker
+        try:
+            if message.guild and not message.author.bot:
+                max_hist = await self.config.max_history()
+                asyncio.create_task(
+                    self._prefetch_recent_user_history(
+                        guild_id=message.guild.id,
+                        channel_id=message.channel.id,
+                        user_id=message.author.id,
+                        max_items=max_hist
+                    )
+                )
+        except Exception:
+            pass
 
     @commands.Cog.listener()
     async def on_message_edit(self, before: discord.Message, after: discord.Message):
@@ -480,7 +543,7 @@ class AprilTalk(commands.Cog):
             "guild_id": str(after.guild.id) if after.guild else "DM",
             "source": "april"
         }
-        await self._loki_push([{"stream": labels, "values": [[ns, json.dumps(edit_data)]]}])
+        asyncio.create_task(self._loki_push([{"stream": labels, "values": [[ns, json.dumps(edit_data)]]}]))
 
     @commands.Cog.listener()
     async def on_message_delete(self, message: discord.Message):
@@ -504,7 +567,7 @@ class AprilTalk(commands.Cog):
             "guild_id": str(message.guild.id) if message.guild else "DM",
             "source": "april"
         }
-        await self._loki_push([{"stream": labels, "values": [[ns, json.dumps(delete_data)]]}])
+        asyncio.create_task(self._loki_push([{"stream": labels, "values": [[ns, json.dumps(delete_data)]]}]))
 
     # ---------------- Commands ----------------
 
@@ -514,12 +577,10 @@ class AprilTalk(commands.Cog):
         if not await self._is_allowed_to_interact(ctx):
             return
 
-        # Vision if attachments
         image_urls = self._collect_image_attachments(ctx.message)
         if image_urls:
             return await self._vision_describe(ctx, image_urls, input)
 
-        # Drawing intent (context aware)
         if self._is_draw_intent(input) or self._looks_like_vague_draw(input):
             return await self._contextual_draw(ctx, input)
 
@@ -560,7 +621,6 @@ class AprilTalk(commands.Cog):
         await self.config.sleep_user_id.set(str(uid))
         await ctx.send(f"🔒 Allowed user set to <@{uid}>.")
 
-    # Loki quick controls
     @april.command(name="lokiurl")
     @commands.is_owner()
     async def lokiurl_cmd(self, ctx: commands.Context, url: str):
@@ -634,7 +694,6 @@ class AprilTalk(commands.Cog):
                 data = await self._with_limit(self._api_sem, self._loki_query_range(logql, start_ns, end_ns, limit))
                 streams = data.get("data", {}).get("result", [])
                 if not streams:
-                    # fallback to simple substring on raw line
                     q = (
                         f'{{app="discord-bot",event_type="message",guild_id="{ctx.guild.id}",channel_id="{ctx.channel.id}"}}'
                         f' |= "{uid or uname}"'
@@ -703,6 +762,14 @@ class AprilTalk(commands.Cog):
                 self._ctx(ctx.channel.id)["last_subject"] = query
         except Exception as e:
             await ctx.send(f"⚠️ recall failed: `{e}`")
+
+    @commands.command(name="prewarm")
+    @commands.guild_only()
+    async def prewarm(self, ctx: commands.Context, user: Optional[discord.Member] = None):
+        user = user or ctx.author
+        max_hist = await self.config.max_history()
+        lines = await self._prefetch_recent_user_history(ctx.guild.id, ctx.channel.id, user.id, max_hist)
+        await ctx.send(f"🔥 Prewarmed {len(lines)} recent lines for {user.display_name}.")
 
     # Voice
     @april.command(name="join")
@@ -794,18 +861,37 @@ class AprilTalk(commands.Cog):
                     max_hist = await self.config.max_history()
                     self.history[ch] = deque(maxlen=max_hist * 2)
 
+                # Short-term memory (secretly from Loki) for author
+                author_lines = []
+                try:
+                    if ctx.guild:
+                        max_hist = await self.config.max_history()
+                        author_lines = await self._prefetch_recent_user_history(
+                            guild_id=ctx.guild.id,
+                            channel_id=ctx.channel.id,
+                            user_id=ctx.author.id,
+                            max_items=max_hist
+                        )
+                except Exception:
+                    author_lines = []
+
                 system_prompt = (await self.config.smert_prompt()) if smert_mode else (await self.config.system_prompt())
                 messages = [{"role": "system", "content": system_prompt}]
 
-                # Loki RAG injection if asked
+                if author_lines:
+                    mem_text = "Recent things this user said here:\n" + "\n".join(f"- {ln}" for ln in author_lines)
+                    messages.append({"role": "system", "content": mem_text})
+
+                # Deep history only when asked
                 if self._looks_like_memory_request(input_text):
                     topic = re.sub(r"^(april|hey|hi|please|can you)\s+", "", input_text, flags=re.I).strip()
                     snippets = await self._loki_search_snippets(ctx, topic or "interesting|fact|todo|plan", since="365d", k=30)
                     loki_context_text = await self._summarize_snippets_into_facts(ctx.author.id, snippets, goal="Provide an interesting, relevant fact this user might care about.")
                     if loki_context_text:
                         messages.append({"role": "system", "content": f"[history-facts]\n{loki_context_text}"})
+                        messages.append({"role": "assistant", "content": "I just looked back through your channel history and pulled some highlights; I’ll weave them into my answer naturally."})
 
-                # inject cached recall if present
+                # Inject cached recall
                 ch_recall = self.recall.get(ch, {})
                 if ch_recall:
                     mems = []
@@ -831,31 +917,42 @@ class AprilTalk(commands.Cog):
                 self.history[ch].append({"role": "user", "content": input_text})
                 self.history[ch].append({"role": "assistant", "content": clean})
 
-                # Update conversational subject (heuristic)
                 ctxobj = self._ctx(ch)
                 m = re.search(r"([A-Z][^.!?\n]{5,60})", clean)
                 if m:
                     ctxobj["last_subject"] = m.group(1).strip()
 
+                # Async GIF selection, do not block streaming
+                gif_url = None
+
+                async def _gif():
+                    nonlocal gif_url
+                    try:
+                        emotion = await self.detect_emotion(clean)
+                        gif_url = await self._pick_gif(emotion)
+                    except Exception:
+                        gif_url = None
+
+                task_gif = asyncio.create_task(_gif())
+
                 tasks = []
                 if not (use_voice and not await self.config.text_response_when_voice()):
-                    tasks.append(asyncio.create_task(self.send_streamed_response(ctx, clean)))
+                    tasks.append(asyncio.create_task(self.send_streamed_response(ctx, clean, task_gif=task_gif)))
                 if use_voice:
                     tasks.append(asyncio.create_task(self.speak_response(ctx, clean)))
                 if draw_prompt:
                     styled = self.style_prompt(draw_prompt)
                     ctxobj["last_image_prompt"] = styled
-                    tasks.append(asyncio.create_task(self._render_and_send_image(ctx, styled, prefix="pic related:")))
+                    tasks.append(asyncio.create_task(self._render_and_send_image(ctx, styled, prefix="Let me sketch this")))
                 if tasks:
                     await asyncio.gather(*tasks, return_exceptions=True)
 
             except Exception as e:
                 await ctx.send(f"❌ Error: {e}")
 
-    async def send_streamed_response(self, ctx: commands.Context, resp: str):
+    async def send_streamed_response(self, ctx: commands.Context, resp: str, task_gif: Optional[asyncio.Task] = None):
         max_len = await self.config.max_message_length()
-        emotion = await self.detect_emotion(resp)
-        gif_url = await self._pick_gif(emotion)
+        gif_url = None
 
         if len(resp) > max_len:
             words = resp.split()
@@ -869,6 +966,15 @@ class AprilTalk(commands.Cog):
                     cur_len += len(w) + 1
             if cur:
                 chunks.append(" ".join(cur))
+
+            # Wait for GIF only before last send
+            if task_gif:
+                try:
+                    await task_gif
+                    gif_url = task_gif.result()
+                except Exception:
+                    gif_url = None
+
             for i, chunk in enumerate(chunks):
                 suffix = f"\n{gif_url}" if gif_url and i == len(chunks) - 1 else ""
                 await ctx.send(chunk + suffix)
@@ -876,15 +982,20 @@ class AprilTalk(commands.Cog):
         else:
             embed = discord.Embed(description="💭 *Thinking...*")
             msg = await ctx.send(embed=embed)
-            size = getattr(self, "_chunk_size", 180)
-            delay = getattr(self, "_edit_delay", 0.03)
+            size = getattr(self, "_chunk_size", 240)
+            delay = getattr(self, "_edit_delay", 0.05)
             for i in range(0, len(resp), size):
                 chunk = resp[:i + size]
-                if i + size >= len(resp) and gif_url:
-                    await msg.edit(content=chunk + f"\n{gif_url}", embed=None)
-                else:
-                    await msg.edit(content=chunk + "▌", embed=None)
+                await msg.edit(content=chunk + ("▌" if i + size < len(resp) else ""), embed=None)
                 await asyncio.sleep(delay)
+
+            if task_gif:
+                try:
+                    await task_gif
+                    gif_url = task_gif.result()
+                except Exception:
+                    gif_url = None
+
             await msg.edit(content=resp + (f"\n{gif_url}" if gif_url else ""), embed=None)
 
     # ---------------- TTS / Images / Models / Vision ----------------
@@ -960,7 +1071,7 @@ class AprilTalk(commands.Cog):
             "model": await self.config.model(),
             "messages": messages,
             "temperature": await self.config.temperature(),
-            "max_tokens": await self.config.max_tokens(),
+            "max_tokens": min(1024, await self.config.max_tokens()),
             "user": str(user_id),
         }
         async with self.session.post("https://api.deepseek.com/v1/chat/completions", json=payload, headers=headers, timeout=60) as r:
@@ -994,7 +1105,7 @@ class AprilTalk(commands.Cog):
         payload = {
             "model": "claude-3-5-sonnet-20241022",
             "messages": convo,
-            "max_tokens": await self.config.max_tokens(),
+            "max_tokens": min(1024, await self.config.max_tokens()),
             "temperature": await self.config.temperature(),
         }
         if system_content:
@@ -1085,16 +1196,53 @@ class AprilTalk(commands.Cog):
 
         styled = self.style_prompt(re.sub(r"\s+", " ", crafted).strip())
         ctxobj["last_image_prompt"] = styled
-        return await self._render_and_send_image(ctx, styled, prefix="pic related:")
+        return await self._render_and_send_image(ctx, styled, prefix="Let me sketch this")
 
     async def _render_and_send_image(self, ctx: commands.Context, styled_prompt: str, prefix: Optional[str] = None):
+        # 1) start render ASAP (in parallel)
+        render_task = asyncio.create_task(
+            self._with_limit(self._api_sem, self.generate_openai_image_png(styled_prompt, size="1024x1024"))
+        )
+
+        # 2) artist narration via DeepSeek
+        artist_system = {
+            "role": "system",
+            "content": (
+                "You are April, a friendly concept artist narrating in real time as you start sketching. "
+                "Keep it brief (2–4 short lines). Present tense. No asterisks. No markdown. "
+                "Mention 1–2 vivid details from the prompt and a quick technique note (composition, brush, palette). "
+                "End with: '— ok, exporting the piece.'"
+            ),
+        }
+        artist_user = {
+            "role": "user",
+            "content": (
+                f"I'm about to draw this:\n{styled_prompt}\n"
+                "Narrate your first moments laying it out and the feel you're going for."
+            ),
+        }
+
+        artist_text = None
         try:
-            async with ctx.typing():
-                png = await self._with_limit(self._api_sem, self.generate_openai_image_png(styled_prompt, size="1024x1024"))
-                await ctx.send(
-                    content=(prefix + "\n" if prefix else "") + f"**Prompt:** {styled_prompt}",
-                    file=discord.File(BytesIO(png), filename="april_draw.png")
-                )
+            artist_text = await self._with_limit(self._api_sem, self.query_deepseek(ctx.author.id, [artist_system, artist_user]))
+            artist_text = artist_text.strip()
+            if len(artist_text) > 600:
+                artist_text = artist_text[:600].rsplit(" ", 1)[0] + "…"
+        except Exception:
+            artist_text = f"Ok — I’ll sketch this: **{styled_prompt}**\nLaying in the shapes and light… — ok, exporting the piece."
+
+        try:
+            await self.send_streamed_response(ctx, artist_text)
+        except Exception:
+            await ctx.send(artist_text)
+
+        # 3) when render completes, send the image (or error)
+        try:
+            png = await render_task
+            await ctx.send(
+                content="Here you go 🎨",
+                file=discord.File(BytesIO(png), filename="april_draw.png")
+            )
         except Exception as e:
             await ctx.send(f"⚠️ Image failed: `{e}`")
 
