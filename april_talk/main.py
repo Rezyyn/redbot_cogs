@@ -23,6 +23,7 @@ log = logging.getLogger("red.apriltalk")
 log.setLevel(logging.DEBUG)
 
 STYLE_SUFFIX = ", in a futuristic neo-cyberpunk aesthetic"
+TENOR_ENDPOINT = "https://tenor.googleapis.com/v2/search"
 
 FALLBACK_GIFS = {
     "happy": [
@@ -52,29 +53,24 @@ FALLBACK_GIFS = {
     ],
 }
 
-TENOR_ENDPOINT = "https://tenor.googleapis.com/v2/search"
-
 
 class AprilTalk(commands.Cog):
     """April: chat + voice + Loki recall + Tenor GIFs + Vision intake + context-aware drawing"""
 
     def __init__(self, bot: Red):
         self.bot = bot
-        # keep the SAME identifier to preserve existing config
         self.config = Config.get_conf(self, identifier=1398462)
 
         self.session = aiohttp.ClientSession()
 
-        # per-channel conversation memory and recall cache
-        self.history: Dict[int, deque] = {}
-        self.recall: Dict[int, Dict[str, List[str]]] = {}
+        # Memory
+        self.history: Dict[int, deque] = {}  # channel_id -> deque of chat messages
+        self.recall: Dict[int, Dict[str, List[str]]] = {}  # channel_id -> {user: [lines]}
+        self.ctx_state: Dict[int, Dict] = {}  # channel_id -> {"last_subject": str, "last_image_prompt": str}
 
-        # conversational context per channel
-        self.ctx_state: Dict[int, Dict] = {}  # {channel_id: {"last_subject": str, "last_image_prompt": str}}
-
-        # perf tunables
-        self._api_sem = asyncio.Semaphore(3)   # limit concurrent external calls
-        self._tts_sem = asyncio.Semaphore(1)   # serialize TTS
+        # Concurrency
+        self._api_sem = asyncio.Semaphore(3)
+        self._tts_sem = asyncio.Semaphore(1)
         self._edit_delay = 0.03
         self._chunk_size = 180
 
@@ -83,7 +79,7 @@ class AprilTalk(commands.Cog):
         self.tts_dir.mkdir(exist_ok=True, parents=True)
         self.tts_files = set()
 
-        # defaults
+        # Defaults
         self.config.register_global(
             deepseek_key="",
             anthropic_key="",
@@ -107,7 +103,7 @@ class AprilTalk(commands.Cog):
             # Tenor
             tenor_key="",
             tenor_enabled=True,
-            # Sleep mode (allow only specific user)
+            # Sleep
             sleep_enabled=False,
             sleep_user_id="165548483128983552",
             # Vision
@@ -136,7 +132,7 @@ class AprilTalk(commands.Cog):
             finally:
                 self.tts_files.discard(p)
 
-    # ---------------- Small utils ----------------
+    # ---------------- Utils ----------------
 
     def _ctx(self, channel_id: int) -> Dict:
         if channel_id not in self.ctx_state:
@@ -163,7 +159,7 @@ class AprilTalk(commands.Cog):
             pass
         return allowed_int is not None and ctx.author.id == allowed_int
 
-    # Voice helpers
+    # Lavalink helpers
     def get_player(self, guild_id: int):
         try:
             return lavalink.get_player(guild_id)
@@ -192,7 +188,7 @@ class AprilTalk(commands.Cog):
             pass
         return None
 
-    # Style & intent
+    # Prompt / intent helpers
     def style_prompt(self, prompt: str) -> str:
         p = prompt.strip()
         if any(k in p.lower() for k in ["cyberpunk", "synthwave", "futuristic", "sci-fi", "science fiction", "blade runner"]):
@@ -281,136 +277,13 @@ class AprilTalk(commands.Cog):
         arr = FALLBACK_GIFS.get(emotion, [])
         return random.choice(arr) if arr else None
 
-    # ---------------- Loki helpers ----------------
-
-    # ---------------- Loki helpers (REPLACE these) ----------------
+    # ---------------- Loki ----------------
 
     def _normalize_loki_base(self, configured_url: str) -> str:
-        """
-        Normalize user-provided Loki URL to the site base (no trailing /api/...).
-        Accepts:
-          - http://loki:3100
-          - http://loki:3100/loki/api/v1/push
-          - https://example.com/loki
-        Returns the base (e.g. http://loki:3100)
-        """
-        if not configured_url:
-            return ""
-        raw = configured_url.strip()
-        # remove trailing slash(es)
-        raw = raw.rstrip("/")
-        # If user accidentally pasted full API path, strip the known suffixes
-        for suffix in ("/loki/api/v1/push", "/loki/api/v1", "/loki"):
-            if raw.endswith(suffix):
-                raw = raw[: -len(suffix)]
-                raw = raw.rstrip("/")
-                break
+        raw = (configured_url or "").rstrip("/")
+        if raw.endswith("/loki/api/v1/push"):
+            return raw[: -len("/loki/api/v1/push")]
         return raw
-
-    async def _loki_query_range(self, query: str, start_ns: int, end_ns: int, limit: int = 50):
-        """
-        Query Loki's /loki/api/v1/query_range and return the parsed JSON.
-        This function logs the full URL, params and returns helpful errors.
-        """
-        cfg = await self.config.all()
-        base = self._normalize_loki_base(cfg.get("loki_url", ""))
-        if not base:
-            raise RuntimeError("Loki base URL not configured (aprilcfg lokiurl).")
-
-        url = f"{base}/loki/api/v1/query_range"
-        headers = {}
-        if cfg.get("loki_token"):
-            headers["Authorization"] = f"Bearer {cfg['loki_token']}"
-
-        params = {
-            "query": query,
-            # Loki accepts RFC3339 or epoch nanoseconds; we pass ns as string
-            "start": str(start_ns),
-            "end": str(end_ns),
-            "limit": str(limit),
-            "direction": "backward",
-        }
-
-        # Helpful debug log
-        log.debug("Loki query_range -> url=%s params=%s headers=%s", url, {k: (v if k!="query" else v[:200]+"...") for k,v in params.items()}, ("AUTH" if headers else "no-auth"))
-
-        try:
-            async with self.session.get(url, params=params, headers=headers, timeout=20) as r:
-                text = await r.text()
-                if r.status != 200:
-                    # raise a clear error including body so you can see Loki error text in Discord
-                    raise RuntimeError(f"Loki HTTP {r.status}: {text[:1000]}")
-                return await r.json()
-        except asyncio.TimeoutError:
-            raise RuntimeError("Loki query timed out (timeout=20s).")
-        except aiohttp.ClientConnectorError as e:
-            raise RuntimeError(f"Connection error to Loki: {e}")
-        except Exception as e:
-            # bubble up the message
-            raise RuntimeError(f"Loki query failed: {e}")
-
-    async def _loki_search_snippets(self, ctx: commands.Context, query_text: str, since: str = "30d", k: int = 20) -> List[Dict]:
-        """
-        Search Loki for snippets matching keywords in query_text scoped to the current
-        guild+channel. Returns up to k unique, recent messages as dicts {ts, who, text, when}.
-        """
-        # compute ns range
-        end_ns = int(time.time() * 1_000_000_000)
-        start_ns = self._since_to_ns(since)
-
-        # build a robust "match any of these words" regex for |~ operator
-        words = [w for w in re.findall(r"[A-Za-z0-9#@._-]+", query_text) if len(w) > 1]
-        regex = "|".join(re.escape(w) for w in words) if words else ".*"
-
-        # Label selection — we proactively try a couple of label shapes if needed later
-        logql = (
-            f'{{app="discord-bot",event_type="message",guild_id="{ctx.guild.id}",channel_id="{ctx.channel.id}"}} '
-            f'|~ "{regex}" | json'
-        )
-
-        # Run the query and handle errors cleanly
-        try:
-            data = await self._with_limit(self._api_sem, self._loki_query_range(logql, start_ns, end_ns, limit=max(50, k)))
-        except Exception as e:
-            # return empty list to the caller but log the error
-            log.debug("Loki search failed: %s", e)
-            return []
-
-        rows = []
-        # Parse results — Loki returns {data: {result: [{stream:..., values: [[ts,line],...]}, ...]}}
-        for series in data.get("data", {}).get("result", []):
-            for ts, val in series.get("values", []):
-                # val is the raw line string (we expect JSON)
-                try:
-                    obj = json.loads(val)
-                    content = obj.get("content") or ""
-                    author = (obj.get("author") or {}).get("name") or (obj.get("author") or {}).get("id") or "user"
-                except Exception:
-                    # fallback: try a quoted "content":"..." extract
-                    m = re.search(r'"content"\s*:\s*"([^"]*)"', val)
-                    content = m.group(1) if m else val
-                    m2 = re.search(r'"author"\s*:\s*{[^}]*"name"\s*:\s*"([^"]*)"', val)
-                    author = m2.group(1) if m2 else "user"
-                rows.append({"ts": int(ts), "who": author, "text": content})
-
-        # dedupe and return newest-first
-        rows.sort(key=lambda r: r["ts"], reverse=True)
-        seen = set()
-        out = []
-        for r in rows:
-            key = r["text"].strip().lower()
-            if not key:
-                continue
-            if key in seen:
-                continue
-            seen.add(key)
-            r["when"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(r["ts"] / 1_000_000_000))
-            out.append(r)
-            if len(out) >= k:
-                break
-
-        return out
-
 
     def _since_to_ns(self, since: str) -> int:
         m = re.fullmatch(r"(\d+)([hd])", since or "24h")
@@ -435,14 +308,65 @@ class AprilTalk(commands.Cog):
             return base + f' | author.name="{user_name}"'
         return base
 
-
+    async def _loki_query_range(self, query: str, start_ns: int, end_ns: int, limit: int = 50):
+        cfg = await self.config.all()
+        base = self._normalize_loki_base(cfg.get("loki_url", ""))
+        url = f"{base}/loki/api/v1/query_range"
+        headers = {}
+        if cfg.get("loki_token"):
+            headers["Authorization"] = f"Bearer {cfg['loki_token']}"
+        params = {
+            "query": query,
+            "start": str(start_ns),
+            "end": str(end_ns),
+            "limit": str(limit),
+            "direction": "backward",
+        }
         async with self.session.get(url, params=params, headers=headers, timeout=20) as r:
             if r.status != 200:
                 body = await r.text()
                 raise RuntimeError(f"Loki {r.status} at {url}: {body}")
             return await r.json()
 
-
+    async def _loki_search_snippets(self, ctx: commands.Context, query_text: str, since: str = "30d", k: int = 20) -> List[Dict]:
+        end_ns = int(time.time() * 1_000_000_000)
+        start_ns = self._since_to_ns(since)
+        terms = [re.escape(w) for w in re.findall(r"[A-Za-z0-9#@._-]+", query_text) if len(w) > 1]
+        regex = "|".join(terms) if terms else "."
+        logql = (
+            f'{{app="discord-bot",event_type="message",guild_id="{ctx.guild.id}",channel_id="{ctx.channel.id}"}} '
+            f'|~ "{regex}" | json'
+        )
+        try:
+            data = await self._with_limit(self._api_sem, self._loki_query_range(logql, start_ns, end_ns, limit=max(50, k)))
+        except Exception:
+            return []
+        rows = []
+        for s in data.get("data", {}).get("result", []):
+            for ts, line in s.get("values", []):
+                try:
+                    obj = json.loads(line)
+                    content = obj.get("content") or ""
+                    author = (obj.get("author") or {}).get("name") or "user"
+                except Exception:
+                    m = re.search(r'"content"\s*:\s*"([^"]*)"', line)
+                    content = m.group(1) if m else line
+                    m2 = re.search(r'"author"\s*:\s*{[^}]*"name"\s*:\s*"([^"]*)"', line)
+                    author = m2.group(1) if m2 else "user"
+                rows.append({"ts": int(ts), "who": author, "text": content})
+        rows.sort(key=lambda r: r["ts"], reverse=True)
+        seen = set()
+        uniq = []
+        for r in rows:
+            key = r["text"].strip().lower()
+            if key and key not in seen:
+                seen.add(key)
+                uniq.append(r)
+            if len(uniq) >= k:
+                break
+        for r in uniq:
+            r["when"] = time.strftime("%Y-%m-%d %H:%M", time.localtime(r["ts"] / 1_000_000_000))
+        return uniq
 
     async def _summarize_snippets_into_facts(self, user_id: int, snippets: List[Dict], goal: str) -> str:
         if not snippets:
@@ -460,16 +384,15 @@ class AprilTalk(commands.Cog):
     @commands.group(name="april", invoke_without_command=True)
     @commands.cooldown(1, 10, commands.BucketType.user)
     async def april(self, ctx: commands.Context, *, input: str):
-        """Main April command (chat) with drawing+vision routing."""
         if not await self._is_allowed_to_interact(ctx):
             return
 
-        # Vision: image attachments
+        # Vision if attachments
         image_urls = self._collect_image_attachments(ctx.message)
         if image_urls:
             return await self._vision_describe(ctx, image_urls, input)
 
-        # Draw routing (context-aware)
+        # Drawing intent (context aware)
         if self._is_draw_intent(input) or self._looks_like_vague_draw(input):
             return await self._contextual_draw(ctx, input)
 
@@ -489,7 +412,6 @@ class AprilTalk(commands.Cog):
 
     @april.command(name="again")
     async def april_draw_again(self, ctx: commands.Context, *, tweak: str = ""):
-        """Re-render the last image with a tweak, e.g. `.april again but darker`"""
         ctxobj = self._ctx(ctx.channel.id)
         last = ctxobj.get("last_image_prompt")
         if not last:
@@ -498,7 +420,6 @@ class AprilTalk(commands.Cog):
         ctxobj["last_image_prompt"] = styled
         return await self._render_and_send_image(ctx, styled, prefix="again:")
 
-    # Sleep controls
     @april.command(name="sleep")
     @commands.is_owner()
     async def april_sleep(self, ctx: commands.Context, enabled: bool):
@@ -513,7 +434,7 @@ class AprilTalk(commands.Cog):
         await self.config.sleep_user_id.set(str(uid))
         await ctx.send(f"🔒 Allowed user set to <@{uid}>.")
 
-    # Loki controls mirrored here
+    # Loki quick controls
     @april.command(name="lokiurl")
     @commands.is_owner()
     async def lokiurl_cmd(self, ctx: commands.Context, url: str):
@@ -550,21 +471,9 @@ class AprilTalk(commands.Cog):
         except Exception as e:
             await ctx.send(f"❌ lokiverify failed: `{e}`")
 
-    @april.command(name="lokitest")
-    async def lokitest_cmd(self, ctx: commands.Context):
-        try:
-            end_ns = int(time.time() * 1_000_000_000)
-            start_ns = end_ns - 5 * 60 * 1_000_000_000
-            data = await self._loki_query_range('{app="discord-bot"}', start_ns, end_ns, 5)
-            count = sum(len(s.get("values", [])) for s in data.get("data", {}).get("result", []))
-            await ctx.send(f"🧪 lokitest ok: {count} entries in last 5m.")
-        except Exception as e:
-            await ctx.send(f"❌ lokitest failed: `{e}`")
-
     @april.command(name="fetch")
     @commands.guild_only()
     async def april_fetch(self, ctx: commands.Context, user_mention: str, since: Optional[str] = "24h", limit: Optional[int] = 20):
-        """Fetch recent messages for @user from Loki and cache as recall memory."""
         if not await self._is_allowed_to_interact(ctx):
             return
         if not ctx.guild:
@@ -636,10 +545,6 @@ class AprilTalk(commands.Cog):
 
     @april.command(name="recall")
     async def april_recall(self, ctx: commands.Context, *, query: str = "interesting fact  OR plan OR todo"):
-        """
-        Mine the channel’s Loki history for highlights and summarize them.
-        Usage: .april recall beefy haggis ; .april recall deploy plan
-        """
         try:
             async with ctx.typing():
                 snippets = await self._loki_search_snippets(ctx, query, since="365d", k=30)
@@ -650,7 +555,6 @@ class AprilTalk(commands.Cog):
                     return await ctx.send("I found entries, but couldn’t summarize them right now.")
                 for page in pagify(facts, page_length=1800):
                     await ctx.send(page)
-                # seed the subject so follow-up "draw it" has context
                 self._ctx(ctx.channel.id)["last_subject"] = query
         except Exception as e:
             await ctx.send(f"⚠️ recall failed: `{e}`")
@@ -757,7 +661,7 @@ class AprilTalk(commands.Cog):
                     if loki_context_text:
                         messages.append({"role": "system", "content": f"[history-facts]\n{loki_context_text}"})
 
-                # inject cached recall (manual fetch) if present
+                # inject cached manual recall if present
                 ch_recall = self.recall.get(ch, {})
                 if ch_recall:
                     mems = []
@@ -783,7 +687,7 @@ class AprilTalk(commands.Cog):
                 self.history[ch].append({"role": "user", "content": input_text})
                 self.history[ch].append({"role": "assistant", "content": clean})
 
-                # Update conversational subject (cheap heuristic)
+                # Update conversational subject (heuristic)
                 ctxobj = self._ctx(ch)
                 m = re.search(r"([A-Z][^.!?\n]{5,60})", clean)
                 if m:
@@ -917,8 +821,12 @@ class AprilTalk(commands.Cog):
         }
         async with self.session.post("https://api.deepseek.com/v1/chat/completions", json=payload, headers=headers, timeout=60) as r:
             if r.status != 200:
-                data = await r.json()
-                raise Exception(data.get("error", {}).get("message", f"HTTP {r.status}"))
+                try:
+                    data = await r.json()
+                    msg = data.get("error", {}).get("message", f"HTTP {r.status}")
+                except Exception:
+                    msg = f"HTTP {r.status}"
+                raise Exception(msg)
             data = await r.json()
             return data["choices"][0]["message"]["content"].strip()
 
@@ -953,7 +861,7 @@ class AprilTalk(commands.Cog):
             data = await r.json()
             return data["content"][0]["text"].strip()
 
-    # Vision intake
+    # Vision
     def _collect_image_attachments(self, message: discord.Message) -> List[str]:
         urls = []
         for att in message.attachments:
@@ -997,7 +905,6 @@ class AprilTalk(commands.Cog):
             await ctx.send(f"❌ Vision failed: {e}")
 
     async def _contextual_draw(self, ctx: commands.Context, user_text: str):
-        """Builds an image prompt from last subject, user text, and (optional) Loki snippets."""
         ch = ctx.channel.id
         ctxobj = self._ctx(ch)
         last_subject = ctxobj.get("last_subject") or ""
@@ -1049,12 +956,11 @@ class AprilTalk(commands.Cog):
         except Exception as e:
             await ctx.send(f"⚠️ Image failed: `{e}`")
 
-    # ---------------- Config group (.aprilcfg) ----------------
+    # ---------------- Config (.aprilcfg) ----------------
 
     @commands.group(name="aprilconfig", aliases=["aprilcfg"])
     @commands.is_owner()
     async def aprilconfig(self, ctx: commands.Context):
-        """Configure April (alias: .aprilcfg)"""
         if ctx.invoked_subcommand is None:
             await self.show_settings(ctx)
 
@@ -1189,30 +1095,6 @@ class AprilTalk(commands.Cog):
         uid = user_id or ctx.author.id
         await self.config.sleep_user_id.set(str(uid))
         await ctx.send(f"🔒 Allowed user set to <@{uid}>.")
-    @april.command(name="lokidebug")
-    @commands.is_owner()
-    async def lokidebug(self, ctx: commands.Context, q: Optional[str] = "{app=\"discord-bot\"}"):
-        """
-        Debug Loki connectivity & query. Example:
-        .april lokidebug '{app="discord-bot"}'
-        """
-        cfg = await self.config.all()
-        base = self._normalize_loki_base(cfg.get("loki_url", ""))
-        if not base:
-            return await ctx.send("❌ Loki URL not set (use .aprilcfg lokiurl)")
-
-        # time window: last 1 hour
-        end_ns = int(time.time() * 1_000_000_000)
-        start_ns = end_ns - (60 * 60 * 1_000_000_000)
-
-        try:
-            await ctx.send(f"🔎 Querying Loki at `{base}/loki/api/v1/query_range` with query:\n```{q}```\nstart: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_ns/1e9))}\nend: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(end_ns/1e9))}")
-            data = await self._loki_query_range(q, start_ns, end_ns, limit=5)
-            # show a short sample of the returned JSON so you can inspect labels/values
-            sample = json.dumps(data.get("data", {}), indent=2)[:1800]
-            await ctx.send(f"✅ Loki returned (truncated):\n```\n{sample}\n```")
-        except Exception as e:
-            await ctx.send(f"❌ Loki debug failed: `{e}`")
 
     @aprilconfig.command(name="settings")
     async def show_settings(self, ctx: commands.Context):
