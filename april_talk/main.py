@@ -117,6 +117,9 @@ class AprilTalk(commands.Cog):
             sleep_user_id="165548483128983552",
             # Vision
             vision_provider="openai",
+            # Audio localtracks config
+            localtracks_root="",          # absolute path that matches .audioset localpath
+            localtracks_subdir="april",   # subfolder under localtracks root for TTS files
         )
 
         self.config.register_user(
@@ -491,7 +494,7 @@ class AprilTalk(commands.Cog):
                     "size": a.size,
                     "content_type": a.content_type
                 } for a in message.attachments],
-                    "embeds": [{
+                "embeds": [{
                     "type": e.type,
                     "title": e.title,
                     "description": e.description
@@ -1012,27 +1015,79 @@ class AprilTalk(commands.Cog):
     async def speak_response(self, ctx: commands.Context, text: str):
         tts_key = await self.config.tts_key()
         if not tts_key:
-            return
+            return  # silently skip if no key
+
+        # must be in voice
         player = self.get_player(ctx.guild.id)
         if not self.is_player_connected(player):
             return
+
+        # sanitize text
         clean = self.clean_text_for_tts(text)
         if not clean:
             return
-        if len(clean) > 800:
-            clean = clean[:800].rsplit(' ', 1)[0] + "..."
+        if len(clean) > 900:
+            clean = clean[:900].rsplit(" ", 1)[0] + "..."
+
+        # generate audio
         audio = await self._with_limit(self._tts_sem, self.generate_tts_audio(clean, tts_key))
         if not audio:
+            try:
+                await ctx.send("⚠️ TTS failed to generate audio.")
+            except Exception:
+                pass
             return
-        localtrack_dir = cog_data_path(self).parent / "Audio" / "localtracks" / "april_tts"
-        localtrack_dir.mkdir(parents=True, exist_ok=True)
-        filename = f"tts_{int(time.time())}_{random.randint(1000, 9999)}.mp3"
-        filepath = localtrack_dir / filename
-        with open(filepath, "wb") as f:
-            f.write(audio)
+
+        # Decide where to write the file
+        root = (await self.config.localtracks_root()).strip()
+        subdir = (await self.config.localtracks_subdir()).strip() or "april"
+
+        if root:
+            # User provided localtracks root; this MUST match `.audioset localpath`
+            outdir = Path(root) / subdir
+            play_query = f"localtracks/{subdir}"
+        else:
+            # Fallback to Red's Audio/localtracks area
+            outdir = cog_data_path(self).parent / "Audio" / "localtracks" / "april_tts"
+            play_query = "localtracks/april_tts"
+
+        outdir.mkdir(parents=True, exist_ok=True)
+
+        # write file
+        fname = f"tts_{int(time.time())}_{random.randint(1000, 9999)}.mp3"
+        fpath = outdir / fname
+        try:
+            with open(fpath, "wb") as f:
+                f.write(audio)
+        except Exception as e:
+            try:
+                await ctx.send(f"❌ Failed to write TTS file: `{e}`")
+            except Exception:
+                pass
+            return
+
+        # play it via Audio cog (localtracks/…)
         audio_cog = self.bot.get_cog("Audio")
-        if audio_cog:
-            await audio_cog.command_play(ctx, query=f"localtracks/april_tts/{filename}")
+        if not audio_cog:
+            try:
+                await ctx.send(f"✅ TTS saved at `{fpath}` but Audio cog not loaded. To play: `{play_query}/{fname}`")
+            except Exception:
+                pass
+            return
+
+        query = f"{play_query}/{fname}"
+        try:
+            if hasattr(audio_cog, "command_play"):
+                await audio_cog.command_play(ctx, query=query)
+            else:
+                await ctx.invoke(audio_cog.play, query=query)  # fallback shape
+        except Exception as e:
+            try:
+                await ctx.send(f"❌ Couldn’t play `{query}`: `{e}`\n"
+                               f"Check `.audioset localpath` is set to `{root or (cog_data_path(self).parent / 'Audio' / 'localtracks')}`\n"
+                               f"and the file exists at `{fpath}`")
+            except Exception:
+                pass
 
     async def generate_tts_audio(self, text: str, api_key: str) -> Optional[bytes]:
         voice_id = await self.config.voice_id()
@@ -1385,6 +1440,58 @@ class AprilTalk(commands.Cog):
     async def cfg_lokiverify(self, ctx: commands.Context):
         await self.lokiverify_cmd(ctx)
 
+    @aprilconfig.command(name="localtracks")
+    @commands.is_owner()
+    async def cfg_localtracks(self, ctx: commands.Context, root: str, subdir: str = "april"):
+        root = root.rstrip("/")
+        await self.config.localtracks_root.set(root)
+        await self.config.localtracks_subdir.set(subdir)
+        await ctx.send(f"✅ Localtracks root set to `{root}`, subdir `{subdir}`.\n"
+                       f"I will save TTS into: `{root}/{subdir}` and play with: `localtracks/{subdir}/<file.mp3>`")
+
+    @aprilconfig.command(name="ttsdebug")
+    @commands.is_owner()
+    async def cfg_ttsdebug(self, ctx: commands.Context, *, text: str = "This is a TTS test from April."):
+        tts_key = await self.config.tts_key()
+        if not tts_key:
+            return await ctx.send("❌ No ElevenLabs key set. Use `[p]aprilcfg elevenlabs <key>`")
+
+        root = (await self.config.localtracks_root()).strip()
+        subdir = (await self.config.localtracks_subdir()).strip() or "april"
+
+        if not root:
+            return await ctx.send("❌ `localtracks_root` not set. Configure it with `[p]aprilcfg localtracks <abs_path> [subdir]`.\n"
+                                  "It must match your `.audioset localpath` value.")
+
+        outdir = Path(root) / subdir
+        outdir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            audio = await self.generate_tts_audio(text, tts_key)
+            if not audio:
+                return await ctx.send("❌ TTS generation failed.")
+            fname = f"ttsdebug_{int(time.time())}_{random.randint(1000,9999)}.mp3"
+            fpath = outdir / fname
+            with open(fpath, "wb") as f:
+                f.write(audio)
+        except Exception as e:
+            return await ctx.send(f"❌ Error writing TTS file: `{e}`")
+
+        query = f"localtracks/{subdir}/{fname}"
+        audio_cog = self.bot.get_cog("Audio")
+        if not audio_cog:
+            return await ctx.send(f"✅ File saved at `{fpath}` but Audio cog not loaded. Query would be: `{query}`")
+
+        try:
+            if hasattr(audio_cog, "command_play"):
+                await audio_cog.command_play(ctx, query=query)
+            else:
+                await ctx.invoke(audio_cog.play, query=query)
+            await ctx.send(f"▶️ Playing `{query}`")
+        except Exception as e:
+            await ctx.send(f"❌ Couldn’t play `{query}`: `{e}`\n"
+                           f"Confirm `.audioset localpath` == `{root}` and file exists: `{fpath}`")
+
     @aprilconfig.command(name="settings")
     async def show_settings(self, ctx: commands.Context):
         cfg = await self.config.all()
@@ -1411,6 +1518,8 @@ class AprilTalk(commands.Cog):
         e.add_field(name="Loki Push Enabled", value="✅" if cfg.get("loki_push_enabled") else "❌", inline=True)
         e.add_field(name="Sleep Mode", value="😴 ON" if cfg.get("sleep_enabled") else "💬 OFF", inline=True)
         e.add_field(name="Sleep Allowed User", value=f"<@{cfg.get('sleep_user_id','')}>" if cfg.get("sleep_user_id") else "—", inline=True)
+        e.add_field(name="Localtracks Root", value=f"{cfg.get('localtracks_root') or '—'}", inline=False)
+        e.add_field(name="Localtracks Subdir", value=f"{cfg.get('localtracks_subdir') or 'april'}", inline=True)
         sp = cfg['system_prompt'][:200] + ("..." if len(cfg['system_prompt']) > 200 else "")
         sm = cfg['smert_prompt'][:200] + ("..." if len(cfg['smert_prompt']) > 200 else "")
         e.add_field(name="System Prompt", value=f"```{sp}```", inline=False)
