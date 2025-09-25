@@ -1,23 +1,25 @@
 # april_talk.py
-# Full drop-in Red cog for April (talk-only)
+# Full Red cog for April (talk-only)
 # - Keeps Config ID = 1398462
-# - Fixes missing _collect_image_attachments
-# - Uses localtracks-only playback for TTS (no YouTube fallback)
-# - Adds artist-style chatter while generating images
-# - Pulls recent context from Loki (silent bootstrap) and uses it as memory
-# - Adds sleep mode to only reply to a specific user when enabled
-# - Keeps lightweight async throttling and background archiving for TTS files
+# - STRICT localtracks playback to avoid YouTube fallback
+# - Fixes _collect_image_attachments missing method
+# - Artist-style chatter while generating images
+# - Loki-powered memory bootstrap and on-demand recall
+# - Sleep mode (reply only to owner when enabled)
+# - TTS archive (or delete) after playback
+# - Gentle concurrency controls for TTS/image
 
 import asyncio
 import aiohttp
+import base64
+import contextlib
 import discord
 import json
-import os
-import time
-import base64
-import random
 import logging
+import os
+import random
 import re
+import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
@@ -64,14 +66,16 @@ TENOR_GIFS = {
 
 
 class AprilTalk(commands.Cog):
-    """April Talk — chat, images, TTS (localtracks), and Loki-powered memory"""
+    """April Talk — chat, images, TTS (strict localtracks), and Loki-powered memory"""
 
     def __init__(self, bot: Red):
         self.bot = bot
         self.session = aiohttp.ClientSession()
         self.config = Config.get_conf(self, identifier=1398462)
+
         # Global config
         self.config.register_global(
+            # Models & prompts
             deepseek_key="",
             anthropic_key="",
             openai_key="",
@@ -85,29 +89,30 @@ class AprilTalk(commands.Cog):
             smert_prompt=(
                 "You are April in 'smert' mode — witty, sharp, and insightful, with broad knowledge."
             ),
+            # TTS & messaging
             tts_enabled=True,
             text_response_when_voice=True,
-            voice_id="21m00Tcm4TlvDq8ikWAM",  # ElevenLabs default
-            # Streaming / message
+            voice_id="21m00Tcm4TlvDq8ikWAM",
             max_history=5,
             max_message_length=1800,
             use_gifs=True,
             # Localtracks & archive
-            localtracks_root="",           # must match `.audioset localpath` if set; else fallback path is used
-            localtracks_subdir="april",    # will save under localtracks/<subdir>
+            localtracks_root="",           # must match `.audioset localpath` if set; else uses Red default
+            localtracks_subdir="april",    # saved under localtracks/<subdir>
             tts_archive_after=90,
             tts_archive_keep=True,
             # Loki
             loki_query_url="",             # e.g. http://host:3100/loki/api/v1/query_range
             loki_token="",
-            loki_default_range="48h",      # default lookback for bootstrapping
-            loki_bootstrap_on_start=True,  # fetch initial history on first message in channel
+            loki_default_range="48h",
+            loki_bootstrap_on_start=True,
             loki_label_app="discord-bot",
             loki_label_event="message",
             # Sleep mode
             sleep_enabled=False,
-            sleep_owner_id=165548483128983552,  # only this user can wake/talk-to when sleeping
+            sleep_owner_id=165548483128983552,
         )
+
         # Per-user config
         self.config.register_user(
             smert_mode=False,
@@ -120,15 +125,12 @@ class AprilTalk(commands.Cog):
         self._tts_sem = asyncio.Semaphore(2)
         self._img_sem = asyncio.Semaphore(2)
 
-        # Per-channel rolling history for chat
+        # Per-channel rolling history (chat memory)
         self._history: Dict[int, deque] = {}
         # Track if loki bootstrap done per channel
         self._loki_bootstrapped: Dict[int, bool] = {}
 
-        # TTS staging
-        self._tts_files_to_watch: Dict[int, Path] = {}
-
-    # --------------- Utility: lavalink player helpers ---------------
+    # ---------------------- Lavalink helpers ----------------------
 
     def get_player(self, guild_id: int):
         try:
@@ -166,7 +168,7 @@ class AprilTalk(commands.Cog):
             log.error("get_player_channel_id error: %s", e)
         return None
 
-    # --------------- Utils: text + images + gifs ---------------
+    # ---------------------- Utils: text/images/gifs ----------------------
 
     def style_prompt(self, prompt: str) -> str:
         p = prompt.strip()
@@ -204,7 +206,6 @@ class AprilTalk(commands.Cog):
                 if any(x in ct for x in ["image/", "jpg", "jpeg", "png", "webp", "gif"]):
                     urls.append(a.url)
                 else:
-                    # heuristic on filename
                     if str(a.filename).lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".gif")):
                         urls.append(a.url)
             for e in getattr(message, "embeds", []) or []:
@@ -214,39 +215,34 @@ class AprilTalk(commands.Cog):
                     urls.append(e.thumbnail.url)
         except Exception as e:
             log.debug("collect_image_attachments error: %s", e)
-        return urls[:8]  # cap
+        return urls[:8]
 
-    # --------------- Commands ---------------
+    # ---------------------- Commands ----------------------
 
     @commands.group(name="april", invoke_without_command=True)
     @commands.cooldown(1, 10, commands.BucketType.user)
     async def april(self, ctx: commands.Context, *, input: str):
         """Main April command"""
-        # Optional sleep gate
         if await self._sleep_gate(ctx):
             return
 
-        # quick helpers
-        cmd = input.strip()
-        low = cmd.lower()
-        if low == "join":
+        cmd = input.strip().lower()
+        if cmd == "join":
             return await self.join_voice(ctx)
-        if low == "leave":
+        if cmd == "leave":
             return await self.leave_voice(ctx)
-        if low == "clearhistory":
+        if cmd == "clearhistory":
             return await self.clear_history(ctx)
-        if low == "smert":
+        if cmd == "smert":
             return await self.toggle_smert_mode(ctx)
 
-        # images in the same command message are considered "context images"
         image_urls = self._collect_image_attachments(ctx.message)
-
-        await self.process_query(ctx, cmd, context_images=image_urls)
+        await self.process_query(ctx, input, context_images=image_urls)
 
     @april.command(name="draw")
     @commands.cooldown(1, 10, commands.BucketType.user)
     async def april_draw(self, ctx: commands.Context, *, prompt: str):
-        """Draw with OpenAI Images (keeps conversation context and chats while generating)."""
+        """Draw with OpenAI Images (keeps context and chats while generating)."""
         if await self._sleep_gate(ctx):
             return
 
@@ -255,14 +251,12 @@ class AprilTalk(commands.Cog):
 
         # Artist chatter via DeepSeek while generating
         try:
-            artist_text = await self._artist_chatter(ctx, styled_prompt)
-        except Exception as e:
+            artist_text = await self._artist_chatter(styled_prompt)
+        except Exception:
             artist_text = f"Ok—I'll paint this: **{styled_prompt}** (warming up my neon palette…)"
 
-        # send the chatter right away
         await ctx.send(artist_text)
 
-        # Now actually render
         try:
             async with self._img_sem:
                 png = await self.generate_openai_image_png(styled_prompt, size="1024x1024")
@@ -355,7 +349,7 @@ class AprilTalk(commands.Cog):
             await ucfg.smert_mode.set(False)
             await ctx.send("💡 Smert mode OFF.")
 
-    # --------------- Config group ---------------
+    # ---------------------- Config group ----------------------
 
     @commands.group(name="aprilcfg")
     @commands.is_owner()
@@ -371,7 +365,7 @@ class AprilTalk(commands.Cog):
         with contextlib.suppress(Exception):
             await ctx.message.delete()
 
-    @aprilcfg.command(name="anthropicKey")
+    @aprilcfg.command(name="anthropickey")
     async def cfg_anthropic(self, ctx: commands.Context, key: str):
         await self.config.anthropic_key.set(key)
         await ctx.tick()
@@ -432,10 +426,10 @@ class AprilTalk(commands.Cog):
             e.add_field(name=k, value=f"`{v}`", inline=True)
         await ctx.send(embed=e)
 
-    # --------------- Core flow ---------------
+    # ---------------------- Core flow ----------------------
 
     async def process_query(self, ctx: commands.Context, input_text: str, *, context_images: Optional[List[str]] = None):
-        # voice?
+        # TTS?
         use_voice = False
         if await self.config.tts_enabled():
             try:
@@ -444,18 +438,17 @@ class AprilTalk(commands.Cog):
             except Exception:
                 use_voice = False
 
-        # ensure per-channel history deque
         cid = ctx.channel.id
         if cid not in self._history:
             max_hist = await self.config.max_history()
             self._history[cid] = deque(maxlen=max_hist * 2)
 
-        # bootstrap from Loki silently once per channel
+        # Bootstrap from Loki only once per channel
         if not self._loki_bootstrapped.get(cid) and (await self.config.loki_bootstrap_on_start()):
             self._loki_bootstrapped[cid] = True
             asyncio.create_task(self._bootstrap_loki_history(ctx))
 
-        # build messages for LLM
+        # Build messages
         ucfg = self.config.user(ctx.author)
         smert = await ucfg.smert_mode()
         if smert:
@@ -465,16 +458,15 @@ class AprilTalk(commands.Cog):
 
         messages = [{"role": "system", "content": sys_prompt}]
         messages.extend(self._history[cid])
-        user_content = input_text
 
-        # include image context as plaintext hints (provider-agnostic)
+        user_content = input_text
         if context_images:
             imgs_text = "\n".join(f"[image]: {u}" for u in context_images)
             user_content = f"{input_text}\n\nAttached images:\n{imgs_text}"
 
         messages.append({"role": "user", "content": user_content})
 
-        # get response
+        # LLM call
         async with ctx.typing():
             try:
                 if smert:
@@ -485,31 +477,27 @@ class AprilTalk(commands.Cog):
                 log.exception("LLM error")
                 return await ctx.send(f"❌ Error: {e}")
 
-        # detect <draw>…</draw>
         draw_prompt = self.maybe_extract_draw_prompt(resp)
         clean_resp = re.sub(r"<draw>.*?</draw>", "", resp, flags=re.IGNORECASE | re.DOTALL).strip()
 
-        # update in-memory history
+        # Update memory
         self._history[cid].append({"role": "user", "content": input_text})
         self._history[cid].append({"role": "assistant", "content": clean_resp})
 
-        # send chat and maybe TTS
         tasks = []
         if not (use_voice and not await self.config.text_response_when_voice()):
             tasks.append(asyncio.create_task(self.send_streamed_response(ctx, clean_resp)))
         if use_voice:
             tasks.append(asyncio.create_task(self.speak_response(ctx, clean_resp)))
 
-        # if draw was suggested inline, perform artist chatter + render
         if draw_prompt:
             styled = self.style_prompt(draw_prompt)
 
             async def _draw_flow():
                 try:
-                    chatter = await self._artist_chatter(ctx, styled)
+                    chatter = await self._artist_chatter(styled)
                 except Exception:
                     chatter = f"Let me sketch this idea: **{styled}** …"
-
                 await ctx.send(chatter)
                 try:
                     async with self._img_sem:
@@ -530,7 +518,6 @@ class AprilTalk(commands.Cog):
         emotion = await self.detect_emotion(resp) if use_gifs else None
         gif_url = random.choice(TENOR_GIFS.get(emotion, [])) if (emotion and random.random() < 0.3) else None
 
-        # short one-shot
         if len(resp) <= max_len:
             embed = discord.Embed(description="💭 *Thinking...*", color=await ctx.embed_color())
             msg = await ctx.send(embed=embed)
@@ -546,7 +533,6 @@ class AprilTalk(commands.Cog):
                 await msg.edit(content=resp, embed=None)
             return
 
-        # long split
         embed = discord.Embed(description="💭 *Thinking...*", color=await ctx.embed_color())
         thinking = await ctx.send(embed=embed)
         words = resp.split(" ")
@@ -569,7 +555,7 @@ class AprilTalk(commands.Cog):
             else:
                 await ctx.send(ch)
 
-    # --------------- TTS ---------------
+    # ---------------------- TTS (STRICT localtracks) ----------------------
 
     def clean_text_for_tts(self, text: str) -> str:
         t = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
@@ -597,7 +583,37 @@ class AprilTalk(commands.Cog):
             log.error("TTS generation failed: %s", e)
         return None
 
-    async def _ensure_localtracks_registered(self, audio_cog, ctx, root: str) -> bool:
+    def _resolve_localtracks_paths(self) -> Tuple[Path, str]:
+        """
+        Returns (outdir_path, rel_prefix) where rel_prefix is what commands expect.
+        If localtracks_root not configured, use Red's default: data/Audio/localtracks
+        """
+        root = (self.bot.loop.run_until_complete(self.config.localtracks_root())  # careful in sync context
+                if asyncio.get_event_loop().is_running() is False else None)
+        # The above trick is risky; instead, return placeholders; speak_response will call an async version.
+        # We'll never call this sync helper in practice; kept for completeness.
+        base = cog_data_path(self).parent / "Audio" / "localtracks"
+        outdir = base / "april"
+        rel = "localtracks/april"
+        return outdir, rel
+
+    async def _get_localtracks_dirs(self) -> Tuple[Path, str]:
+        root = (await self.config.localtracks_root()).strip()
+        subdir = (await self.config.localtracks_subdir()).strip() or "april"
+        if not root:
+            base = cog_data_path(self).parent / "Audio" / "localtracks"
+            outdir = base / subdir
+            rel = f"localtracks/{subdir}"
+        else:
+            outdir = Path(root) / subdir
+            rel = f"localtracks/{subdir}"
+        return outdir, rel
+
+    async def _ensure_localtracks_registered(self, ctx: commands.Context) -> bool:
+        audio_cog = self.bot.get_cog("Audio")
+        if not audio_cog:
+            return False
+        # Prefer callable APIs
         try:
             if hasattr(audio_cog, "localtracks_scan"):
                 await audio_cog.localtracks_scan(ctx)
@@ -607,17 +623,40 @@ class AprilTalk(commands.Cog):
                 return True
         except Exception:
             pass
+        # Fallback to command
         try:
-            if hasattr(self.bot, "get_command"):
-                cmd = self.bot.get_command("localtracks scan")
-                if cmd:
-                    await ctx.invoke(cmd)
-                    return True
+            cmd = self.bot.get_command("localtracks scan")
+            if cmd:
+                await ctx.invoke(cmd)
+                return True
         except Exception:
             pass
         return False
 
-    async def _archive_or_delete_tts(self, fpath: Path):
+    async def _play_localtracks_strict(self, ctx: commands.Context, rel_path: str) -> bool:
+        """
+        Try ONLY localtracks play variants; NEVER generic play (which may hit YT).
+        Returns True if invoked, False if no suitable command found.
+        """
+        # 1) localtracks play <rel_path>
+        cmd = self.bot.get_command("localtracks play")
+        if cmd:
+            await ctx.invoke(cmd, path=rel_path)
+            return True
+        # 2) local play <rel_path> (some Audio forks)
+        cmd = self.bot.get_command("local play")
+        if cmd:
+            await ctx.invoke(cmd, path=rel_path)
+            return True
+        # 3) audio localtracks play (namespaced)
+        cmd = self.bot.get_command("audio localtracks play")
+        if cmd:
+            await ctx.invoke(cmd, path=rel_path)
+            return True
+        # If none of the above exist, do NOT call generic "play"
+        return False
+
+    async def _archive_or_delete(self, fpath: Path):
         try:
             cfg = await self.config.all()
             delay = int(cfg.get("tts_archive_after", 90))
@@ -643,15 +682,19 @@ class AprilTalk(commands.Cog):
             pass
 
     async def speak_response(self, ctx: commands.Context, text: str):
-        tts_key = await self.config.tts_key()
-        if not tts_key:
-            return
+        # must be connected
         player = self.get_player(ctx.guild.id)
         if not self.is_player_connected(player):
             return
+
+        tts_key = await self.config.tts_key()
+        if not tts_key:
+            return
+
         clean = self.clean_text_for_tts(text)
         if not clean:
             return
+
         async with self._tts_sem:
             audio = await self.generate_tts_audio(clean, tts_key)
         if not audio:
@@ -659,18 +702,8 @@ class AprilTalk(commands.Cog):
                 await ctx.send("⚠️ TTS failed to generate audio.")
             return
 
-        # choose where to save
-        root = (await self.config.localtracks_root()).strip()
-        subdir = (await self.config.localtracks_subdir()).strip() or "april"
-        if not root:
-            base = cog_data_path(self).parent / "Audio" / "localtracks"
-            outdir = base / "april"
-            query_prefix = "localtracks/april"
-        else:
-            outdir = Path(root) / subdir
-            query_prefix = f"localtracks/{subdir}"
+        outdir, rel_prefix = await self._get_localtracks_dirs()
         outdir.mkdir(parents=True, exist_ok=True)
-
         fname = f"tts_{int(time.time())}_{random.randint(1000,9999)}.mp3"
         fpath = outdir / fname
         try:
@@ -681,35 +714,22 @@ class AprilTalk(commands.Cog):
                 await ctx.send(f"❌ Failed to write TTS file: `{e}`")
             return
 
-        audio_cog = self.bot.get_cog("Audio")
-        if not audio_cog:
+        # Ensure localtracks DB is aware of the new file
+        await self._ensure_localtracks_registered(ctx)
+
+        rel_path = f"{rel_prefix}/{fname}"
+
+        # STRICT: Attempt only localtracks play forms. Never generic "play".
+        invoked = await self._play_localtracks_strict(ctx, rel_path)
+        if not invoked:
+            # As a last resort, show the exact command so the user can run it without YT risk.
             with contextlib.suppress(Exception):
-                await ctx.send(f"✅ TTS saved at `{fpath}` but Audio cog is not loaded.")
-            return
+                await ctx.send(f"▶️ Your Audio cog doesn’t expose `localtracks play` — run this manually:\n"
+                               f"`{ctx.prefix}localtracks play {rel_path}`")
+        # Archive/delete later regardless (gives time for playback to finish)
+        asyncio.create_task(self._archive_or_delete(fpath))
 
-        await self._ensure_localtracks_registered(audio_cog, ctx, root or str(outdir.parent))
-
-        query = f"{query_prefix}/{fname}"
-        try:
-            if hasattr(audio_cog, "command_play"):
-                await audio_cog.command_play(ctx, query=query)
-            else:
-                cmd = getattr(self.bot, "get_command", lambda *_: None)("play")
-                if cmd:
-                    await ctx.invoke(cmd, query=query)
-                else:
-                    await ctx.send(f"▶️ To play manually: `{ctx.prefix}play {query}`")
-        except Exception as e:
-            with contextlib.suppress(Exception):
-                await ctx.send(
-                    f"❌ Couldn’t play `{query}`: `{e}`\n"
-                    f"• Ensure `.audioset localpath` matches `{root or (cog_data_path(self).parent / 'Audio' / 'localtracks')}`\n"
-                    f"• File exists: `{fpath}`"
-                )
-
-        asyncio.create_task(self._archive_or_delete_tts(fpath))
-
-    # --------------- Image Gen ---------------
+    # ---------------------- Image Generation ----------------------
 
     async def generate_openai_image_png(self, prompt: str, size: str = "1024x1024") -> bytes:
         key = await self.config.openai_key()
@@ -730,26 +750,23 @@ class AprilTalk(commands.Cog):
             b64 = data["data"][0]["b64_json"]
             return base64.b64decode(b64)
 
-    async def _artist_chatter(self, ctx: commands.Context, styled_prompt: str) -> str:
-        """Ask the chat model to roleplay describing the drawing process while image renders."""
+    async def _artist_chatter(self, styled_prompt: str) -> str:
+        """Ask chat model to roleplay describing the drawing process while image renders."""
         sys = {
             "role": "system",
             "content": (
                 "You are April describing your process as an artist while you work on an image. "
-                "Speak in present tense, short lines. 1-3 sentences. Friendly, vivid, no markdown code fences."
+                "Speak in present tense, 1–3 short sentences. Friendly, vivid, no code fences."
             ),
         }
-        user = {
-            "role": "user",
-            "content": f"Describe starting a piece with this prompt in a casual way: {styled_prompt}",
-        }
+        user = {"role": "user", "content": f"Describe starting a piece casually: {styled_prompt}"}
         try:
             text = await self.query_deepseek(0, [sys, user])
             return text.strip()[:400]
         except Exception:
             return f"Ok—I'll paint this: **{styled_prompt}**"
 
-    # --------------- DeepSeek / Anthropic ---------------
+    # ---------------------- DeepSeek / Anthropic ----------------------
 
     async def query_deepseek(self, user_id: int, messages: list) -> str:
         key = await self.config.deepseek_key()
@@ -807,7 +824,7 @@ class AprilTalk(commands.Cog):
             data = await r.json()
             return data["content"][0]["text"].strip()
 
-    # --------------- Loki memory (query_range) ---------------
+    # ---------------------- Loki Memory (query_range) ----------------------
 
     async def _bootstrap_loki_history(self, ctx: commands.Context):
         """Fetch last few messages (by users in this channel) from Loki and seed memory."""
@@ -826,7 +843,6 @@ class AprilTalk(commands.Cog):
             if not dq:
                 dq = deque(maxlen=(await self.config.max_history()) * 2)
                 self._history[cid] = dq
-            # inject as prior 'user' lines (oldest->newest)
             for entry in logs[-5:]:
                 content = entry.get("content", "")
                 author = entry.get("author", {})
@@ -845,16 +861,11 @@ class AprilTalk(commands.Cog):
         limit: int = 20,
         author_id: Optional[str] = None,
     ) -> List[dict]:
-        """
-        Query Loki /loki/api/v1/query_range with label matchers.
-        We assume messages were logged with labels: app, event_type, channel_id, guild_id.
-        """
         token = await self.config.loki_token()
         app = await self.config.loki_label_app()
         event = await self.config.loki_label_event()
         now = int(datetime.now(timezone.utc).timestamp() * 1e9)
 
-        # Convert a range like "24h" into start ns
         def parse_range(r: str) -> int:
             m = re.fullmatch(r"(\d+)([smhdw])", r.strip(), re.I)
             if not m:
@@ -872,14 +883,13 @@ class AprilTalk(commands.Cog):
             "end": str(now),
         }
 
-        # Build label selector
         labels = [f'app="{app}"', f'event_type="{event}"']
         if channel_id:
             labels.append(f'channel_id="{channel_id}"')
         if guild_id:
             labels.append(f'guild_id="{guild_id}"')
         selector = "{" + ",".join(labels) + "}"
-        query = f'{selector} |= ""'  # no additional filter; use |= to ensure logfmt/JSON ok
+        query = f'{selector} |= ""'
 
         headers = {"Content-Type": "application/json"}
         if token:
@@ -891,7 +901,6 @@ class AprilTalk(commands.Cog):
                 log.debug("Loki query error %s: %s", r.status, txt)
                 return []
             data = await r.json()
-            # Expect resultType=streams
             result = data.get("data", {}).get("result", [])
             out: List[dict] = []
             for stream in result:
@@ -903,11 +912,10 @@ class AprilTalk(commands.Cog):
                         out.append(obj)
                     except Exception:
                         continue
-            # sort ascending by created_at or ts
             out.sort(key=lambda x: x.get("created_at", ""))
             return out
 
-    # --------------- Voice events ---------------
+    # ---------------------- Voice events ----------------------
 
     @commands.Cog.listener()
     async def on_voice_state_update(self, member, before, after):
@@ -929,7 +937,7 @@ class AprilTalk(commands.Cog):
         except Exception as e:
             log.error("voice_state error: %s", e)
 
-    # --------------- Sleep gate ---------------
+    # ---------------------- Sleep gate ----------------------
 
     async def _sleep_gate(self, ctx: commands.Context) -> bool:
         """If sleep mode is on, only reply to configured owner."""
@@ -937,24 +945,17 @@ class AprilTalk(commands.Cog):
             return False
         owner_id = await self.config.sleep_owner_id()
         if int(getattr(ctx.author, "id", 0)) != int(owner_id):
-            # Soft ignore (optional: react)
             with contextlib.suppress(Exception):
                 await ctx.message.add_reaction("😴")
             return True
         return False
 
-    # --------------- Unload / cleanup ---------------
+    # ---------------------- Unload / cleanup ----------------------
 
     def cog_unload(self):
         self._unloading = True
-        try:
+        with contextlib.suppress(Exception):
             self.bot.loop.create_task(self.session.close())
-        except Exception:
-            pass
-
-
-# -------- utility for contextlib suppress without extra import spam
-import contextlib  # noqa: E402
 
 
 async def setup(bot: Red):
