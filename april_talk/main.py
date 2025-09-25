@@ -120,6 +120,8 @@ class AprilTalk(commands.Cog):
             # Audio localtracks config
             localtracks_root="",          # absolute path that matches .audioset localpath
             localtracks_subdir="april",   # subfolder under localtracks root for TTS files
+            tts_archive_after=90,         # seconds before archiving the played TTS file
+            tts_archive_keep=True, 
         )
 
         self.config.register_user(
@@ -288,6 +290,64 @@ class AprilTalk(commands.Cog):
 
         arr = FALLBACK_GIFS.get(emotion, [])
         return random.choice(arr) if arr else None
+    # --- Add this helper below other utils ---
+    async def _ensure_localtracks_registered(self, audio_cog, ctx, root: str):
+        """
+        Make sure Audio cog sees new files:
+        1) If Audio provides a scan command/function, call it.
+        2) If not, attempt to run via command group if present.
+        """
+        try:
+            # Newer Audio cog exposes a scan command method
+            if hasattr(audio_cog, "localtracks_scan"):
+                await audio_cog.localtracks_scan(ctx)
+                return True
+            # Some versions expose it under a command_ name
+            if hasattr(audio_cog, "command_localtracks_scan"):
+                await audio_cog.command_localtracks_scan(ctx)
+                return True
+        except Exception:
+            pass
+    
+        # Worst case, send a hint (non-blocking)
+        try:
+            await ctx.send("🔎 Scanning localtracks so I can play the new TTS…")
+            # As a user would: `localtracks scan` (if the command group is available)
+            if hasattr(self.bot, "get_command"):
+                cmd = self.bot.get_command("localtracks scan")
+                if cmd:
+                    await ctx.invoke(cmd)
+                    return True
+        except Exception:
+            pass
+        return False
+    
+    
+    # --- Add this helper to archive (or delete) after playback ---
+    async def _archive_or_delete_tts(self, fpath: Path):
+        try:
+            cfg = await self.config.all()
+            delay = int(cfg.get("tts_archive_after", 90))
+            keep = bool(cfg.get("tts_archive_keep", True))
+            await asyncio.sleep(max(5, delay))
+            if not fpath.exists():
+                return
+            if keep:
+                archive_dir = fpath.parent / "archive"
+                archive_dir.mkdir(parents=True, exist_ok=True)
+                target = archive_dir / fpath.name
+                try:
+                    fpath.replace(target)
+                except Exception:
+                    # fallback copy+unlink
+                    import shutil
+    
+                    shutil.copy2(fpath, target)
+                    fpath.unlink(missing_ok=True)
+            else:
+                fpath.unlink(missing_ok=True)
+        except Exception:
+            pass
 
     # ---------------- Loki: query/push ----------------
 
@@ -1012,82 +1072,113 @@ class AprilTalk(commands.Cog):
         text = re.sub(r'\s+', ' ', text).strip()
         return text[:1000].rsplit(' ', 1)[0] + "..." if len(text) > 1000 else text
 
-    async def speak_response(self, ctx: commands.Context, text: str):
-        tts_key = await self.config.tts_key()
-        if not tts_key:
-            return  # silently skip if no key
+async def speak_response(self, ctx: commands.Context, text: str):
+    """
+    Generate TTS, save under configured localtracks root/subdir, scan localtracks,
+    then play explicitly using the Audio cog's play command with a localtracks/<...> query.
+    Never fall back to generic search (which can hit YouTube).
+    """
+    tts_key = await self.config.tts_key()
+    if not tts_key:
+        return  # silently skip
 
-        # must be in voice
-        player = self.get_player(ctx.guild.id)
-        if not self.is_player_connected(player):
-            return
+    # must be in voice
+    player = self.get_player(ctx.guild.id)
+    if not self.is_player_connected(player):
+        return
 
-        # sanitize text
-        clean = self.clean_text_for_tts(text)
-        if not clean:
-            return
-        if len(clean) > 900:
-            clean = clean[:900].rsplit(" ", 1)[0] + "..."
+    clean = self.clean_text_for_tts(text)
+    if not clean:
+        return
+    if len(clean) > 900:
+        clean = clean[:900].rsplit(" ", 1)[0] + "..."
 
-        # generate audio
-        audio = await self._with_limit(self._tts_sem, self.generate_tts_audio(clean, tts_key))
-        if not audio:
-            try:
-                await ctx.send("⚠️ TTS failed to generate audio.")
-            except Exception:
-                pass
-            return
+    # generate audio
+    audio = await self._with_limit(
+        self._tts_sem, self.generate_tts_audio(clean, tts_key)
+    )
+    if not audio:
+        try:
+            await ctx.send("⚠️ TTS failed to generate audio.")
+        except Exception:
+            pass
+        return
 
-        # Decide where to write the file
-        root = (await self.config.localtracks_root()).strip()
-        subdir = (await self.config.localtracks_subdir()).strip() or "april"
+    # determine localtracks location
+    root = (await self.config.localtracks_root()).strip()
+    subdir = (await self.config.localtracks_subdir()).strip() or "april"
 
-        if root:
-            # User provided localtracks root; this MUST match `.audioset localpath`
-            outdir = Path(root) / subdir
-            play_query = f"localtracks/{subdir}"
+    if not root:
+        # hard fallback to standard Red path if user didn't configure a custom localtracks_root
+        base = cog_data_path(self).parent / "Audio" / "localtracks"
+        outdir = (
+            base / "april_tts"
+        )  # distinct from user's custom subdir to avoid confusion
+        query_prefix = "localtracks/april_tts"
+    else:
+        outdir = Path(root) / subdir
+        query_prefix = f"localtracks/{subdir}"
+
+    outdir.mkdir(parents=True, exist_ok=True)
+    fname = f"tts_{int(time.time())}_{random.randint(1000, 9999)}.mp3"
+    fpath = outdir / fname
+
+    try:
+        with open(fpath, "wb") as f:
+            f.write(audio)
+    except Exception as e:
+        try:
+            await ctx.send(f"❌ Failed to write TTS file: `{e}`")
+        except Exception:
+            pass
+        return
+
+    audio_cog = self.bot.get_cog("Audio")
+    if not audio_cog:
+        try:
+            await ctx.send(f"✅ TTS saved at `{fpath}` but Audio cog is not loaded.")
+        except Exception:
+            pass
+        return
+
+    # Ensure Audio has indexed the new file
+    await self._ensure_localtracks_registered(
+        audio_cog, ctx, root or str(outdir.parent)
+    )
+
+    # Build a strictly-localtracks query to avoid any provider search
+    query = f"{query_prefix}/{fname}"
+
+    # Try to use the Audio cog's 'play' command function directly if available
+    try:
+        if hasattr(audio_cog, "command_play"):
+            await audio_cog.command_play(ctx, query=query)
         else:
-            # Fallback to Red's Audio/localtracks area
-            outdir = cog_data_path(self).parent / "Audio" / "localtracks" / "april_tts"
-            play_query = "localtracks/april_tts"
-
-        outdir.mkdir(parents=True, exist_ok=True)
-
-        # write file
-        fname = f"tts_{int(time.time())}_{random.randint(1000, 9999)}.mp3"
-        fpath = outdir / fname
-        try:
-            with open(fpath, "wb") as f:
-                f.write(audio)
-        except Exception as e:
-            try:
-                await ctx.send(f"❌ Failed to write TTS file: `{e}`")
-            except Exception:
-                pass
-            return
-
-        # play it via Audio cog (localtracks/…)
-        audio_cog = self.bot.get_cog("Audio")
-        if not audio_cog:
-            try:
-                await ctx.send(f"✅ TTS saved at `{fpath}` but Audio cog not loaded. To play: `{play_query}/{fname}`")
-            except Exception:
-                pass
-            return
-
-        query = f"{play_query}/{fname}"
-        try:
-            if hasattr(audio_cog, "command_play"):
-                await audio_cog.command_play(ctx, query=query)
+            # Try to resolve the 'play' command and call it with our localtracks query.
+            cmd = getattr(self.bot, "get_command", lambda *_: None)("play")
+            if cmd:
+                await ctx.invoke(cmd, query=query)
             else:
-                await ctx.invoke(audio_cog.play, query=query)  # fallback shape
-        except Exception as e:
-            try:
-                await ctx.send(f"❌ Couldn’t play `{query}`: `{e}`\n"
-                               f"Check `.audioset localpath` is set to `{root or (cog_data_path(self).parent / 'Audio' / 'localtracks')}`\n"
-                               f"and the file exists at `{fpath}`")
-            except Exception:
-                pass
+                # As a last resort, tell the user how to play it manually without risking YT
+                await ctx.send(
+                    f"▶️ To play the generated TTS manually, run:\n`{ctx.prefix}play {query}`"
+                )
+    except Exception as e:
+        try:
+            await ctx.send(
+                f"❌ Couldn’t play `{query}`: `{e}`\n"
+                f"• Ensure `.audioset localpath` is set to `{root or (cog_data_path(self).parent / 'Audio' / 'localtracks')}`\n"
+                f"• File exists: `{fpath}`"
+            )
+        except Exception:
+            pass
+        # still archive/delete later
+        asyncio.create_task(self._archive_or_delete_tts(fpath))
+        return
+
+    # Archive/delete the file later (gives Lavalink time to start/finish)
+    asyncio.create_task(self._archive_or_delete_tts(fpath))
+
 
     async def generate_tts_audio(self, text: str, api_key: str) -> Optional[bytes]:
         """
