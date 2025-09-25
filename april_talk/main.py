@@ -1090,14 +1090,39 @@ class AprilTalk(commands.Cog):
                 pass
 
     async def generate_tts_audio(self, text: str, api_key: str) -> Optional[bytes]:
+        """
+        ElevenLabs TTS:
+        - Use Accept: audio/mpeg so the API returns raw audio.
+        - Provide a model_id (turbo or multilingual) to avoid 400s.
+        - Return None on failure.
+        """
         voice_id = await self.config.voice_id()
         url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
-        headers = {"xi-api-key": api_key, "Content-Type": "application/json"}
-        payload = {"text": text, "voice_settings": {"stability": 0.5, "similarity_boost": 0.8}}
-        async with self.session.post(url, json=payload, headers=headers, timeout=30) as r:
-            if r.status == 200:
-                return await r.read()
-        return None
+        headers = {
+            "xi-api-key": api_key,
+            "Content-Type": "application/json",
+            "Accept": "audio/mpeg",
+        }
+        payload = {
+            "model_id": "eleven_turbo_v2",  # or "eleven_multilingual_v2" if you need
+            "text": text,
+            "voice_settings": {"stability": 0.5, "similarity_boost": 0.8},
+        }
+        try:
+            async with self.session.post(
+                url, json=payload, headers=headers, timeout=45
+            ) as r:
+                if r.status == 200:
+                    return await r.read()
+                else:
+                    # read the error body so the probe can display it
+                    err = await r.text()
+                    log.warning(f"ElevenLabs TTS error {r.status}: {err}")
+                    return None
+        except Exception as e:
+            log.warning(f"ElevenLabs call failed: {e}")
+            return None
+
 
     async def generate_openai_image_png(self, prompt: str, size: str = "1024x1024") -> bytes:
         key = await self.config.openai_key()
