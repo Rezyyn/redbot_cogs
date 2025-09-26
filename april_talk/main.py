@@ -1,7 +1,6 @@
 # april_talk.py
-# Full Red cog for April with working Lavalink TTS (integrated from your old code),
-# chat (DeepSeek/Claude), images (OpenAI), GIFs, and handy config commands.
-# Keeps Config ID = 1398462
+# Full Red cog for April with working Lavalink TTS (local file playback) and fixed Config awaits.
+# Keeps Config ID = 1398462. Includes image gen, GIFs, chatter, and robust player handling.
 
 import asyncio
 import aiohttp
@@ -16,7 +15,7 @@ import random
 import re
 import time
 from collections import deque
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -27,10 +26,6 @@ from redbot.core.data_manager import cog_data_path
 
 log = logging.getLogger("red.april_talk")
 log.setLevel(logging.DEBUG)
-
-# ---------------------------
-# Constants / Small resources
-# ---------------------------
 
 STYLE_SUFFIX = ", in a futuristic neo-cyberpunk aesthetic"
 
@@ -63,36 +58,35 @@ EMOTION_GIFS = {
 }
 
 
-# ---------------
-# The Cog
-# ---------------
-
 class AprilTalk(commands.Cog):
-    """April — chat, images, and Lavalink TTS (localtracks)."""
+    """April — chat, images, Loki-aware (via other cog), and Lavalink TTS (local files)."""
 
     def __init__(self, bot: Red):
         self.bot = bot
         self.session = aiohttp.ClientSession()
         self.config = Config.get_conf(self, identifier=1398462)
 
-        # Runtime state
         self._unloading = False
-        self._history: Dict[int, deque] = {}     # channel_id -> deque of chat messages
+        self._history: Dict[int, deque] = {}  # channel_id -> deque
         self._img_sem = asyncio.Semaphore(2)
 
-        # Storage dir (for misc)
-        self.tts_dir = Path(cog_data_path(self)) / "tts"
-        self.tts_dir.mkdir(exist_ok=True, parents=True)
-        self.tts_files = set()
+        # Where we write TTS files (write to BOTH common layouts to maximize compatibility)
+        # A) Red Audio default (localtracks)
+        self.tts_localtracks_dir = cog_data_path(self).parent / "Audio" / "localtracks" / "april_tts"
+        self.tts_localtracks_dir.mkdir(parents=True, exist_ok=True)
+        # B) User-configured localpath (common: /data/cogs/Audio/tts/april)
+        self.tts_alt_root = Path("/data/cogs/Audio/tts")
+        self.tts_alt_dir = self.tts_alt_root / "april"
+        try:
+            self.tts_alt_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
 
-        # Config (global)
         self.config.register_global(
-            # Keys
             deepseek_key="",
             anthropic_key="",
             openai_key="",
-            tts_key="",  # ElevenLabs
-            # LLMs
+            tts_key="",
             model="deepseek-chat",
             temperature=0.7,
             max_tokens=2048,
@@ -105,7 +99,6 @@ class AprilTalk(commands.Cog):
                 "You are April in 'smert' mode — an incredibly intelligent, witty, and creative "
                 "AI assistant with deep knowledge across all domains."
             ),
-            # Messaging / UX
             tts_enabled=True,
             text_response_when_voice=True,
             max_history=5,
@@ -114,46 +107,30 @@ class AprilTalk(commands.Cog):
             voice_id="21m00Tcm4TlvDq8ikWAM",
         )
 
-        # Per-user config
         self.config.register_user(
             smert_mode=False,
             custom_anthropic_key="",
             custom_smert_prompt="",
         )
 
-    # --------------
-    # Cog lifecycle
-    # --------------
-
     def cog_unload(self):
         self._unloading = True
         with contextlib.suppress(Exception):
             self.bot.loop.create_task(self.session.close())
-        # Clean remaining TTS files (best-effort)
-        for path in list(self.tts_files):
-            try:
-                if os.path.exists(path):
-                    os.unlink(path)
-            except Exception:
-                pass
-            finally:
-                self.tts_files.discard(path)
 
-    # -------------------
-    # Utility Helpers
-    # -------------------
+    # -----------------------
+    # Small utilities
+    # -----------------------
 
-    def _ensure_channel_history(self, channel_id: int):
-        if channel_id not in self._history:
-            max_history = self.bot.loop.create_task(self.config.max_history())
-            # in case we can't await here (constructor-like), set a sane default
-            maxlen = 10
-            if hasattr(max_history, "result"):
-                try:
-                    maxlen = int(max_history.result()) * 2
-                except Exception:
-                    pass
-            self._history[channel_id] = deque(maxlen=maxlen)
+    async def _ensure_channel_history(self, channel_id: int):
+        """Ensure per-channel memory deque with correct maxlen."""
+        if channel_id in self._history:
+            return
+        try:
+            max_hist = await self.config.max_history()
+        except Exception:
+            max_hist = 5
+        self._history[channel_id] = deque(maxlen=int(max_hist) * 2)
 
     def style_prompt(self, prompt: str) -> str:
         p = prompt.strip()
@@ -162,7 +139,6 @@ class AprilTalk(commands.Cog):
         return p + STYLE_SUFFIX
 
     def _collect_image_attachments(self, message: discord.Message) -> List[str]:
-        """Collect image URLs from attachments/embeds to use as chat context."""
         urls: List[str] = []
         try:
             for a in getattr(message, "attachments", []) or []:
@@ -195,12 +171,12 @@ class AprilTalk(commands.Cog):
             return "sad"
         return None
 
-    # -------------------
-    # Lavalink Helpers
-    # -------------------
+    # -----------------------
+    # Lavalink helpers
+    # -----------------------
 
     def get_player(self, guild_id: int):
-        """Safe player getter — no exceptions if missing."""
+        """Try multiple ways to retrieve a lavalink player to avoid 'No such player' errors."""
         try:
             pm = getattr(lavalink, "player_manager", None)
             if pm:
@@ -247,15 +223,13 @@ class AprilTalk(commands.Cog):
             return None
         return None
 
-    # -------------------
+    # -----------------------
     # Commands
-    # -------------------
+    # -----------------------
 
     @commands.group(name="april", invoke_without_command=True)
     @commands.cooldown(1, 10, commands.BucketType.user)
     async def april(self, ctx: commands.Context, *, input: str):
-        """Main April command."""
-        # short-hands
         low = input.strip().lower()
         if low == "join":
             return await self.join_voice(ctx)
@@ -272,9 +246,7 @@ class AprilTalk(commands.Cog):
     @april.command(name="draw")
     @commands.cooldown(1, 10, commands.BucketType.user)
     async def april_draw(self, ctx: commands.Context, *, prompt: str):
-        """Generate an image via OpenAI Images."""
         styled = self.style_prompt(prompt.strip())
-        # while generating, speak casually like an artist
         chatter = await self._artist_chatter(styled)
         await ctx.send(chatter)
 
@@ -283,7 +255,6 @@ class AprilTalk(commands.Cog):
                 png = await self.generate_openai_image_png(styled, size="1024x1024")
             file = discord.File(BytesIO(png), filename="april_draw.png")
             await ctx.send(content=f"**Image prompt used:** {styled}", file=file)
-            # remember context
             self._remember_draw_context(ctx.channel.id, styled)
         except Exception as e:
             log.exception("Draw failed")
@@ -291,7 +262,6 @@ class AprilTalk(commands.Cog):
 
     @april.command(name="join")
     async def join_voice(self, ctx: commands.Context):
-        """Join your current voice channel."""
         if not ctx.author.voice or not ctx.author.voice.channel:
             return await ctx.send("❌ You must be in a voice channel.")
         ch = ctx.author.voice.channel
@@ -299,7 +269,6 @@ class AprilTalk(commands.Cog):
         if not perms.connect or not perms.speak:
             return await ctx.send("❌ I need permissions to connect and speak!")
         try:
-            # disconnect from other channel if already connected
             player = self.get_player(ctx.guild.id)
             if player and self.is_player_connected(player):
                 cur = self.get_player_channel_id(player)
@@ -318,7 +287,6 @@ class AprilTalk(commands.Cog):
 
     @april.command(name="leave")
     async def leave_voice(self, ctx: commands.Context):
-        """Leave voice."""
         try:
             player = self.get_player(ctx.guild.id)
             if player and self.is_player_connected(player):
@@ -332,7 +300,6 @@ class AprilTalk(commands.Cog):
 
     @april.command(name="clearhistory")
     async def clear_history(self, ctx: commands.Context):
-        """Clear channel memory (not Loki)."""
         cid = ctx.channel.id
         if cid in self._history:
             self._history[cid].clear()
@@ -340,7 +307,6 @@ class AprilTalk(commands.Cog):
 
     @april.command(name="smert")
     async def toggle_smert_mode(self, ctx: commands.Context):
-        """Toggle 'smert' mode (Claude if key present)."""
         ucfg = self.config.user(ctx.author)
         mode = await ucfg.smert_mode()
         if not mode:
@@ -357,14 +323,13 @@ class AprilTalk(commands.Cog):
             await ucfg.smert_mode.set(False)
             await ctx.send("💡 Smert mode OFF.")
 
-    # -------------------
-    # Config commands
-    # -------------------
+    # -----------------------
+    # Config
+    # -----------------------
 
     @commands.group(name="aprilcfg", aliases=["aprilconfig"])
     @commands.is_owner()
     async def aprilcfg(self, ctx: commands.Context):
-        """Configure April."""
         if ctx.invoked_subcommand is None:
             await self.show_settings(ctx)
 
@@ -488,12 +453,11 @@ class AprilTalk(commands.Cog):
         e.add_field(name="Smert Prompt", value=f"```{sm}```", inline=False)
         await ctx.send(embed=e)
 
-    # ---------------
+    # -----------------------
     # Core chat flow
-    # ---------------
+    # -----------------------
 
     async def process_query(self, ctx: commands.Context, input_text: str, *, context_images: Optional[List[str]] = None):
-        # Should we voice?
         use_voice = False
         if await self.config.tts_enabled():
             try:
@@ -503,7 +467,6 @@ class AprilTalk(commands.Cog):
             except Exception:
                 use_voice = False
 
-        # Mode & prompts
         ucfg = self.config.user(ctx.author)
         smert = await ucfg.smert_mode()
         if smert:
@@ -512,9 +475,8 @@ class AprilTalk(commands.Cog):
             sys_prompt = await self.config.system_prompt()
 
         cid = ctx.channel.id
-        self._ensure_channel_history(cid)
+        await self._ensure_channel_history(cid)
 
-        # Build messages
         messages = [{"role": "system", "content": sys_prompt}]
         messages.extend(self._history[cid])
 
@@ -522,10 +484,8 @@ class AprilTalk(commands.Cog):
         if context_images:
             imgs_text = "\n".join(f"[image]: {u}" for u in context_images)
             user_content = f"{input_text}\n\nAttached images:\n{imgs_text}"
-
         messages.append({"role": "user", "content": user_content})
 
-        # Call model
         async with ctx.typing():
             try:
                 if smert:
@@ -536,11 +496,9 @@ class AprilTalk(commands.Cog):
                 log.exception("LLM error")
                 return await ctx.send(f"❌ Error: {e}")
 
-        # Extract <draw> blocks, remove from visible text
         draw_prompt = self._maybe_extract_draw_prompt(resp)
         clean_resp = re.sub(r"<draw>.*?</draw>", "", resp, flags=re.IGNORECASE | re.DOTALL).strip()
 
-        # Update rolling memory
         self._history[cid].append({"role": "user", "content": input_text})
         self._history[cid].append({"role": "assistant", "content": clean_resp})
 
@@ -557,7 +515,7 @@ class AprilTalk(commands.Cog):
                 try:
                     chatter = await self._artist_chatter(styled)
                 except Exception:
-                    chatter = f"Let me sketch this: **{styled}** …"
+                    chatter = f"Ok—I'll paint this: **{styled}**"
                 await ctx.send(chatter)
                 try:
                     async with self._img_sem:
@@ -573,7 +531,6 @@ class AprilTalk(commands.Cog):
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    # streaming text + optional GIF
     async def send_streamed_response(self, ctx: commands.Context, resp: str):
         max_length = await self.config.max_message_length()
         use_gifs = await self.config.use_gifs()
@@ -585,7 +542,6 @@ class AprilTalk(commands.Cog):
         if len(resp) <= max_length:
             embed = discord.Embed(description="💭 *Thinking...*", color=await ctx.embed_color())
             msg = await ctx.send(embed=embed)
-
             chunk_size = 50
             for i in range(0, len(resp), chunk_size):
                 chunk = resp[: i + chunk_size]
@@ -594,12 +550,10 @@ class AprilTalk(commands.Cog):
                 else:
                     await msg.edit(content=chunk + "▌", embed=None)
                 await asyncio.sleep(0.05)
-
             if not gif_url:
                 await msg.edit(content=resp, embed=None)
             return
 
-        # split long
         embed = discord.Embed(description="💭 *Thinking...*", color=await ctx.embed_color())
         thinking_msg = await ctx.send(embed=embed)
 
@@ -624,12 +578,11 @@ class AprilTalk(commands.Cog):
             else:
                 await ctx.send(ch)
 
-    # -------------
-    # TTS (OLD FLOW integrated): ElevenLabs -> file in Audio/localtracks/april_tts -> play via Audio.command_play
-    # -------------
+    # -----------------------
+    # TTS
+    # -----------------------
 
     def clean_text_for_tts(self, text: str) -> str:
-        # Remove markdown and links
         text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
         text = re.sub(r"\*(.*?)\*", r"\1", text)
         text = re.sub(r"`(.*?)`", r"\1", text)
@@ -641,19 +594,11 @@ class AprilTalk(commands.Cog):
         return text
 
     async def generate_tts_audio(self, text: str, api_key: str) -> Optional[bytes]:
-        """ElevenLabs API call (as in your working version)."""
         try:
             voice_id = await self.config.voice_id()
             url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
-            payload = {
-                "text": text,
-                "voice_settings": {
-                    "stability": 0.5,
-                    "similarity_boost": 0.8,
-                },
-            }
+            payload = {"text": text, "voice_settings": {"stability": 0.5, "similarity_boost": 0.8}}
             headers = {"xi-api-key": api_key, "Content-Type": "application/json"}
-
             log.debug("Requesting TTS for text: %s...", text[:100])
             async with self.session.post(url, json=payload, headers=headers, timeout=60) as resp:
                 if resp.status == 200:
@@ -668,14 +613,39 @@ class AprilTalk(commands.Cog):
             log.error("TTS generation failed: %s", e)
             return None
 
+    async def _write_tts_files(self, audio_bytes: bytes) -> List[Path]:
+        """Write to both known local roots and return the paths written."""
+        paths: List[Path] = []
+        stamp = int(time.time())
+        suffix = f"{stamp}_{random.randint(1000, 9999)}.mp3"
+
+        # A) localtracks/april_tts
+        p1 = self.tts_localtracks_dir / f"tts_{suffix}"
+        try:
+            with open(p1, "wb") as f:
+                f.write(audio_bytes)
+            paths.append(p1)
+        except Exception as e:
+            log.error("Write TTS (localtracks) failed: %s", e)
+
+        # B) /data/cogs/Audio/tts/april
+        if self.tts_alt_dir.exists():
+            p2 = self.tts_alt_dir / f"tts_{suffix}"
+            try:
+                with open(p2, "wb") as f:
+                    f.write(audio_bytes)
+                paths.append(p2)
+            except Exception as e:
+                log.error("Write TTS (alt root) failed: %s", e)
+
+        return paths
+
     async def speak_response(self, ctx: commands.Context, text: str):
-        """Generate TTS, write to Audio/localtracks/april_tts, and play via Audio.command_play."""
         tts_key = await self.config.tts_key()
         if not tts_key:
             log.warning("Skipping TTS: missing ElevenLabs key.")
             return
 
-        # Must be connected
         player = self.get_player(ctx.guild.id)
         if not self.is_player_connected(player):
             log.warning("Skipping TTS: player not connected.")
@@ -691,64 +661,85 @@ class AprilTalk(commands.Cog):
                 await ctx.send("TTS failed to generate audio.")
             return
 
-        # Path: <cog_data>/../Audio/localtracks/april_tts/<file>.mp3
-        localtrack_dir = cog_data_path(self).parent / "Audio" / "localtracks" / "april_tts"
-        localtrack_dir.mkdir(parents=True, exist_ok=True)
-
-        filename = f"tts_{int(time.time())}_{random.randint(1000, 9999)}.mp3"
-        filepath = localtrack_dir / filename
-
-        try:
-            with open(filepath, "wb") as f:
-                f.write(audio)
-            self.tts_files.add(str(filepath))
-            log.debug("TTS saved: %s", filepath)
-        except Exception as e:
+        paths = await self._write_tts_files(audio)
+        if not paths:
             with contextlib.suppress(Exception):
-                await ctx.send(f"❌ Failed to write TTS file: `{e}`")
+                await ctx.send("❌ Failed to write TTS file(s).")
             return
 
-        # Play using the Audio cog directly (your working approach)
+        # Try to play via Audio cog. Prefer localtracks path first; fallback to alt root mapping.
         audio_cog = self.bot.get_cog("Audio")
         if not audio_cog:
             log.error("Audio cog not found")
             return
 
-        # IMPORTANT: prefix with localtracks/ so provider doesn't hit YouTube
-        query = f"localtracks/april_tts/{filename}"
-        try:
-            play_cmd = getattr(audio_cog, "command_play", None)
-            if callable(play_cmd):
-                await play_cmd(ctx, query=query)
-            else:
-                # Fallback to invoking the `play` command if attribute differs by version
+        # Build candidate queries that the Audio cog should accept
+        # 1) Default Red Audio localtracks HTTP mapping:
+        queries = []
+        for p in paths:
+            try:
+                if str(p).startswith(str(self.tts_localtracks_dir)):
+                    queries.append(f"localtracks/april_tts/{p.name}")
+            except Exception:
+                pass
+
+        # 2) User-configured localpath mapping (".audioset localpath /data/cogs/Audio/tts")
+        for p in paths:
+            try:
+                if str(p).startswith(str(self.tts_alt_root)):
+                    # Query is the subpath under localpath
+                    sub = p.relative_to(self.tts_alt_root)
+                    queries.append(str(sub).replace("\\", "/"))
+            except Exception:
+                pass
+
+        # Deduplicate preserving order
+        qseen = set()
+        queries = [q for q in queries if not (q in qseen or qseen.add(q))]
+
+        # If nothing was constructed, still try a sane default
+        if not queries:
+            # last resort: try localtracks/april_tts/<name> for first file
+            queries = [f"localtracks/april_tts/{paths[0].name}"]
+
+        played = False
+        for q in queries:
+            try:
+                play_cmd = getattr(audio_cog, "command_play", None)
+                if callable(play_cmd):
+                    await play_cmd(ctx, query=q)
+                    played = True
+                    break
+                # fallback to invoking the global play command
                 play_cmd2 = self.bot.get_command("play")
                 if play_cmd2:
-                    await ctx.invoke(play_cmd2, query=query)
-                else:
-                    await ctx.send(f"▶️ Please run: `{ctx.prefix}play {query}`")
-        except Exception as e:
-            log.exception("Failed to invoke Audio play for TTS: %s", e)
-            with contextlib.suppress(Exception):
-                await ctx.send(f"❌ Failed to play TTS: `{e}`")
-
-        # Cleanup after delay (archive handling could be added later if you want)
-        async def delayed_delete():
-            await asyncio.sleep(30)
-            try:
-                if filepath.exists():
-                    filepath.unlink()
-                    log.debug("TTS file deleted: %s", filepath.name)
+                    await ctx.invoke(play_cmd2, query=q)
+                    played = True
+                    break
             except Exception as e:
-                log.error("Failed to delete TTS file %s — %s", filepath.name, e)
-            finally:
-                self.tts_files.discard(str(filepath))
+                log.error("Attempt to play %s failed: %s", q, e)
+                continue
 
-        asyncio.create_task(delayed_delete())
+        if not played:
+            with contextlib.suppress(Exception):
+                await ctx.send("❌ Failed to play TTS via Audio cog.")
+            return
 
-    # -------------
-    # Images
-    # -------------
+        async def delayed_cleanup():
+            await asyncio.sleep(45)
+            for p in paths:
+                try:
+                    if p.exists():
+                        p.unlink()
+                        log.debug("TTS file deleted: %s", p)
+                except Exception as e:
+                    log.error("Failed to delete TTS file %s — %s", p.name, e)
+
+        asyncio.create_task(delayed_cleanup())
+
+    # -----------------------
+    # Image generation
+    # -----------------------
 
     async def generate_openai_image_png(self, prompt: str, size: str = "1024x1024") -> bytes:
         key = await self.config.openai_key()
@@ -770,7 +761,6 @@ class AprilTalk(commands.Cog):
             return base64.b64decode(b64)
 
     async def _artist_chatter(self, styled_prompt: str) -> str:
-        """Quick 'artist at work' chatter to cover image latency."""
         sys = {
             "role": "system",
             "content": (
@@ -792,14 +782,15 @@ class AprilTalk(commands.Cog):
         return raw or None
 
     def _remember_draw_context(self, channel_id: int, styled_prompt: str):
-        self._ensure_channel_history(channel_id)
+        if channel_id not in self._history:
+            self._history[channel_id] = deque(maxlen=10)
         self._history[channel_id].append(
             {"role": "assistant", "content": f"[image-used-prompt]: {styled_prompt}"}
         )
 
-    # -------------
+    # -----------------------
     # LLM calls
-    # -------------
+    # -----------------------
 
     async def query_deepseek(self, user_id: int, messages: list) -> str:
         key = await self.config.deepseek_key()
@@ -817,10 +808,11 @@ class AprilTalk(commands.Cog):
             "https://api.deepseek.com/v1/chat/completions", json=payload, headers=headers, timeout=60
         ) as r:
             if r.status != 200:
-                with contextlib.suppress(Exception):
+                try:
                     data = await r.json()
                     raise RuntimeError(data.get("error", {}).get("message", f"HTTP {r.status}"))
-                raise RuntimeError(f"DeepSeek HTTP {r.status}")
+                except Exception:
+                    raise RuntimeError(f"DeepSeek HTTP {r.status}")
             data = await r.json()
             return data["choices"][0]["message"]["content"].strip()
 
@@ -856,9 +848,9 @@ class AprilTalk(commands.Cog):
             data = await r.json()
             return data["content"][0]["text"].strip()
 
-    # -------------
+    # -----------------------
     # Voice events
-    # -------------
+    # -----------------------
 
     @commands.Cog.listener()
     async def on_voice_state_update(self, member, before, after):
