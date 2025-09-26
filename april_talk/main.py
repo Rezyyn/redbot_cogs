@@ -1,6 +1,6 @@
 # april_talk.py
-# Full Red cog for April with working Lavalink TTS (local file playback) and fixed Config awaits.
-# Keeps Config ID = 1398462. Includes image gen, GIFs, chatter, and robust player handling.
+# Full Red cog for April with robust Lavalink TTS playback to Audio's configured localtracks.
+# Keeps Config ID = 1398462. Includes chat, image gen, GIFs, and per-channel history.
 
 import asyncio
 import aiohttp
@@ -59,7 +59,7 @@ EMOTION_GIFS = {
 
 
 class AprilTalk(commands.Cog):
-    """April — chat, images, Loki-aware (via other cog), and Lavalink TTS (local files)."""
+    """April — chat + images + per-channel memory + Lavalink TTS using Audio's localtracks."""
 
     def __init__(self, bot: Red):
         self.bot = bot
@@ -70,17 +70,21 @@ class AprilTalk(commands.Cog):
         self._history: Dict[int, deque] = {}  # channel_id -> deque
         self._img_sem = asyncio.Semaphore(2)
 
-        # Where we write TTS files (write to BOTH common layouts to maximize compatibility)
-        # A) Red Audio default (localtracks)
-        self.tts_localtracks_dir = cog_data_path(self).parent / "Audio" / "localtracks" / "april_tts"
-        self.tts_localtracks_dir.mkdir(parents=True, exist_ok=True)
-        # B) User-configured localpath (common: /data/cogs/Audio/tts/april)
+        # Candidate localtracks roots (Audio cog maps "localtracks/<subpath>" to ONE configured root)
+        # We will write the same TTS file to multiple likely roots so whichever Audio root is active will see it.
+        self.localtracks_candidates: List[Path] = [
+            cog_data_path(self).parent / "Audio" / "localtracks",           # /data/cogs/Audio/localtracks
+            Path("/data/cogs/Audio/localtracks"),
+            Path("/data/cogs/Audio/tts/localtracks"),                       # your current Audio localtracks path
+        ]
+        self.tts_subdir = "april"  # we write files to <root>/april/*.mp3 so query is always localtracks/april/<file>
+        self._ensure_dirs()
+
+        # Optional "alt" direct tts path (not used by Audio directly, but we also write here for debugging)
         self.tts_alt_root = Path("/data/cogs/Audio/tts")
         self.tts_alt_dir = self.tts_alt_root / "april"
-        try:
+        with contextlib.suppress(Exception):
             self.tts_alt_dir.mkdir(parents=True, exist_ok=True)
-        except Exception:
-            pass
 
         self.config.register_global(
             deepseek_key="",
@@ -118,12 +122,16 @@ class AprilTalk(commands.Cog):
         with contextlib.suppress(Exception):
             self.bot.loop.create_task(self.session.close())
 
+    def _ensure_dirs(self):
+        for root in self.localtracks_candidates:
+            with contextlib.suppress(Exception):
+                (root / self.tts_subdir).mkdir(parents=True, exist_ok=True)
+
     # -----------------------
     # Small utilities
     # -----------------------
 
     async def _ensure_channel_history(self, channel_id: int):
-        """Ensure per-channel memory deque with correct maxlen."""
         if channel_id in self._history:
             return
         try:
@@ -176,7 +184,6 @@ class AprilTalk(commands.Cog):
     # -----------------------
 
     def get_player(self, guild_id: int):
-        """Try multiple ways to retrieve a lavalink player to avoid 'No such player' errors."""
         try:
             pm = getattr(lavalink, "player_manager", None)
             if pm:
@@ -249,7 +256,6 @@ class AprilTalk(commands.Cog):
         styled = self.style_prompt(prompt.strip())
         chatter = await self._artist_chatter(styled)
         await ctx.send(chatter)
-
         try:
             async with self._img_sem:
                 png = await self.generate_openai_image_png(styled, size="1024x1024")
@@ -614,24 +620,27 @@ class AprilTalk(commands.Cog):
             return None
 
     async def _write_tts_files(self, audio_bytes: bytes) -> List[Path]:
-        """Write to both known local roots and return the paths written."""
+        """Write TTS bytes into every candidate localtracks root under 'april/', plus alt debug dir."""
         paths: List[Path] = []
         stamp = int(time.time())
-        suffix = f"{stamp}_{random.randint(1000, 9999)}.mp3"
+        name = f"tts_{stamp}_{random.randint(1000, 9999)}.mp3"
 
-        # A) localtracks/april_tts
-        p1 = self.tts_localtracks_dir / f"tts_{suffix}"
-        try:
-            with open(p1, "wb") as f:
-                f.write(audio_bytes)
-            paths.append(p1)
-        except Exception as e:
-            log.error("Write TTS (localtracks) failed: %s", e)
-
-        # B) /data/cogs/Audio/tts/april
-        if self.tts_alt_dir.exists():
-            p2 = self.tts_alt_dir / f"tts_{suffix}"
+        # Candidate localtracks roots
+        for root in self.localtracks_candidates:
             try:
+                subdir = root / self.tts_subdir
+                subdir.mkdir(parents=True, exist_ok=True)
+                p = subdir / name
+                with open(p, "wb") as f:
+                    f.write(audio_bytes)
+                paths.append(p)
+            except Exception as e:
+                log.error("Write TTS to %s failed: %s", root, e)
+
+        # Also write to /data/cogs/Audio/tts/april for debugging visibility
+        if self.tts_alt_dir.exists():
+            try:
+                p2 = self.tts_alt_dir / name
                 with open(p2, "wb") as f:
                     f.write(audio_bytes)
                 paths.append(p2)
@@ -667,58 +676,44 @@ class AprilTalk(commands.Cog):
                 await ctx.send("❌ Failed to write TTS file(s).")
             return
 
-        # Try to play via Audio cog. Prefer localtracks path first; fallback to alt root mapping.
         audio_cog = self.bot.get_cog("Audio")
         if not audio_cog:
             log.error("Audio cog not found")
             return
 
-        # Build candidate queries that the Audio cog should accept
-        # 1) Default Red Audio localtracks HTTP mapping:
+        # Always query via "localtracks/april/<filename>" so it matches Audio's configured localtracks root.
         queries = []
         for p in paths:
             try:
-                if str(p).startswith(str(self.tts_localtracks_dir)):
-                    queries.append(f"localtracks/april_tts/{p.name}")
+                if p.name.endswith(".mp3"):
+                    queries.append(f"localtracks/{self.tts_subdir}/{p.name}")
             except Exception:
-                pass
-
-        # 2) User-configured localpath mapping (".audioset localpath /data/cogs/Audio/tts")
-        for p in paths:
-            try:
-                if str(p).startswith(str(self.tts_alt_root)):
-                    # Query is the subpath under localpath
-                    sub = p.relative_to(self.tts_alt_root)
-                    queries.append(str(sub).replace("\\", "/"))
-            except Exception:
-                pass
+                continue
 
         # Deduplicate preserving order
-        qseen = set()
-        queries = [q for q in queries if not (q in qseen or qseen.add(q))]
-
-        # If nothing was constructed, still try a sane default
-        if not queries:
-            # last resort: try localtracks/april_tts/<name> for first file
-            queries = [f"localtracks/april_tts/{paths[0].name}"]
+        seen = set()
+        queries = [q for q in queries if not (q in seen or seen.add(q))]
 
         played = False
         for q in queries:
+            # Try Audio's exposed command interface
             try:
                 play_cmd = getattr(audio_cog, "command_play", None)
                 if callable(play_cmd):
                     await play_cmd(ctx, query=q)
                     played = True
                     break
-                # fallback to invoking the global play command
+            except Exception as e:
+                log.error("Audio.command_play failed for %s: %s", q, e)
+            # Fallback to invoking global [p]play
+            try:
                 play_cmd2 = self.bot.get_command("play")
                 if play_cmd2:
                     await ctx.invoke(play_cmd2, query=q)
                     played = True
                     break
             except Exception as e:
-                log.error("Attempt to play %s failed: %s", q, e)
-                continue
+                log.error("Invoke play failed for %s: %s", q, e)
 
         if not played:
             with contextlib.suppress(Exception):
