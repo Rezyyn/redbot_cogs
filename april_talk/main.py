@@ -1029,50 +1029,69 @@ class AprilTalk(commands.Cog):
                 await ctx.send("❌ Failed to write TTS file(s).")
             return
 
-        audio_cog = self.bot.get_cog("Audio")
-        if not audio_cog:
-            log.error("Audio cog not found")
-            return
-
-        # Always query via "localtracks/april_tts/<filename>" so it matches Audio's configured localtracks root.
-        queries = []
+        # Use Lavalink directly to avoid "Track Enqueued" messages
+        played = False
         for p in paths:
             try:
                 if p.name.endswith(".mp3"):
-                    queries.append(f"localtracks/{self.tts_subdir}/{p.name}")
-            except Exception:
-                continue
-
-        # Deduplicate preserving order
-        seen = set()
-        queries = [q for q in queries if not (q in seen or seen.add(q))]
-
-        played = False
-        for q in queries:
-            # Try Audio's exposed command interface
-            try:
-                play_cmd = getattr(audio_cog, "command_play", None)
-                if callable(play_cmd):
-                    await play_cmd(ctx, query=q)
-                    played = True
-                    break
+                    query = f"localtracks/{self.tts_subdir}/{p.name}"
+                    log.debug("Attempting to play TTS track: %s", query)
+                    
+                    # Get tracks from Lavalink directly
+                    tracks = await lavalink.get_tracks(query)
+                    if tracks and len(tracks) > 0:
+                        track = tracks[0]
+                        
+                        # Add to player queue silently
+                        player.add(requester=ctx.author.id, track=track)
+                        
+                        # Start playing if not already playing
+                        if not player.is_playing:
+                            await player.play()
+                        
+                        log.debug("Successfully added TTS track to player")
+                        played = True
+                        break
+                    else:
+                        log.warning("No tracks found for query: %s", query)
+                        
             except Exception as e:
-                log.error("Audio.command_play failed for %s: %s", q, e)
-            # Fallback to invoking global [p]play
-            try:
-                play_cmd2 = self.bot.get_command("play")
-                if play_cmd2:
-                    await ctx.invoke(play_cmd2, query=q)
-                    played = True
-                    break
-            except Exception as e:
-                log.error("Invoke play failed for %s: %s", q, e)
+                log.error("Direct Lavalink play failed for %s: %s", p.name, e)
+
+        # Fallback to Audio cog methods if direct Lavalink fails
+        if not played:
+            log.warning("Direct Lavalink failed, trying Audio cog fallback")
+            audio_cog = self.bot.get_cog("Audio")
+            if audio_cog:
+                queries = []
+                for p in paths:
+                    try:
+                        if p.name.endswith(".mp3"):
+                            queries.append(f"localtracks/{self.tts_subdir}/{p.name}")
+                    except Exception:
+                        continue
+
+                # Deduplicate preserving order
+                seen = set()
+                queries = [q for q in queries if not (q in seen or seen.add(q))]
+
+                for q in queries:
+                    try:
+                        play_cmd = getattr(audio_cog, "command_play", None)
+                        if callable(play_cmd):
+                            await play_cmd(ctx, query=q)
+                            played = True
+                            break
+                    except Exception as e:
+                        log.error("Audio.command_play failed for %s: %s", q, e)
 
         if not played:
+            log.error("All TTS playback methods failed")
             with contextlib.suppress(Exception):
-                await ctx.send("❌ Failed to play TTS via Audio cog.")
+                await ctx.send("❌ Failed to play TTS audio.")
             return
 
+        # Clean up files after delay
         async def delayed_cleanup():
             await asyncio.sleep(45)
             for p in paths:
