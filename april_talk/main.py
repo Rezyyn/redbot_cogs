@@ -1029,67 +1029,115 @@ class AprilTalk(commands.Cog):
                 await ctx.send("❌ Failed to write TTS file(s).")
             return
 
-        # Use Lavalink directly to avoid "Track Enqueued" messages
+        # Create a silent context to suppress all messages
+        class SilentContext:
+            def __init__(self, original_ctx):
+                self.guild = original_ctx.guild
+                self.channel = original_ctx.channel
+                self.author = original_ctx.author
+                self.bot = original_ctx.bot
+                self.message = original_ctx.message
+                self.prefix = getattr(original_ctx, 'prefix', '.')
+                
+            async def send(self, *args, **kwargs):
+                # Completely suppress all send attempts
+                pass
+                
+            async def tick(self):
+                # Suppress tick responses
+                pass
+                
+            def __getattr__(self, name):
+                # Fallback for any other attributes
+                return getattr(ctx, name, None)
+
+        silent_ctx = SilentContext(ctx)
         played = False
-        for p in paths:
-            try:
-                if p.name.endswith(".mp3"):
-                    query = f"localtracks/{self.tts_subdir}/{p.name}"
-                    log.debug("Attempting to play TTS track: %s", query)
-                    
-                    # Get tracks from Lavalink directly
-                    tracks = await lavalink.get_tracks(query)
-                    if tracks and len(tracks) > 0:
-                        track = tracks[0]
-                        
-                        # Add to player queue silently
-                        player.add(requester=ctx.author.id, track=track)
-                        
-                        # Start playing if not already playing
-                        if not player.is_playing:
-                            await player.play()
-                        
-                        log.debug("Successfully added TTS track to player")
-                        played = True
-                        break
-                    else:
-                        log.warning("No tracks found for query: %s", query)
-                        
-            except Exception as e:
-                log.error("Direct Lavalink play failed for %s: %s", p.name, e)
 
-        # Fallback to Audio cog methods if direct Lavalink fails
-        if not played:
-            log.warning("Direct Lavalink failed, trying Audio cog fallback")
-            audio_cog = self.bot.get_cog("Audio")
-            if audio_cog:
-                queries = []
-                for p in paths:
-                    try:
-                        if p.name.endswith(".mp3"):
-                            queries.append(f"localtracks/{self.tts_subdir}/{p.name}")
-                    except Exception:
-                        continue
-
-                # Deduplicate preserving order
-                seen = set()
-                queries = [q for q in queries if not (q in seen or seen.add(q))]
-
-                for q in queries:
-                    try:
+        # Try using the Audio cog with a silent context first
+        audio_cog = self.bot.get_cog("Audio")
+        if audio_cog:
+            for p in paths:
+                try:
+                    if p.name.endswith(".mp3"):
+                        query = f"localtracks/{self.tts_subdir}/{p.name}"
+                        
+                        # Try the Audio cog's play command with silent context
                         play_cmd = getattr(audio_cog, "command_play", None)
                         if callable(play_cmd):
-                            await play_cmd(ctx, query=q)
+                            await play_cmd(silent_ctx, query=query)
                             played = True
                             break
-                    except Exception as e:
-                        log.error("Audio.command_play failed for %s: %s", q, e)
+                            
+                except Exception as e:
+                    log.error("Silent Audio.command_play failed for %s: %s", p.name, e)
+
+        # Fallback to direct Lavalink if Audio cog approach failed
+        if not played:
+            for p in paths:
+                try:
+                    if p.name.endswith(".mp3"):
+                        query = f"localtracks/{self.tts_subdir}/{p.name}"
+                        log.debug("Attempting direct Lavalink for: %s", query)
+                        
+                        # Get tracks from Lavalink directly
+                        tracks = await lavalink.get_tracks(query)
+                        if tracks and len(tracks) > 0:
+                            track = tracks[0]
+                            
+                            # Add to player queue silently
+                            player.add(requester=ctx.author.id, track=track)
+                            
+                            # Start playing if not already playing
+                            if not player.is_playing:
+                                await player.play()
+                            
+                            log.debug("Successfully added TTS track via direct Lavalink")
+                            played = True
+                            break
+                        else:
+                            log.warning("No tracks found for query: %s", query)
+                            
+                except Exception as e:
+                    log.error("Direct Lavalink play failed for %s: %s", p.name, e)
+
+        # Final fallback - try to override any Audio cog event listeners temporarily
+        if not played:
+            try:
+                # Temporarily disable Audio cog event listeners if possible
+                original_listeners = []
+                if audio_cog and hasattr(audio_cog, '_listeners'):
+                    for event_name, listeners in audio_cog._listeners.items():
+                        if 'track' in event_name.lower():
+                            original_listeners.append((event_name, listeners.copy()))
+                            listeners.clear()
+                
+                # Try playing normally now
+                for p in paths:
+                    if p.name.endswith(".mp3"):
+                        query = f"localtracks/{self.tts_subdir}/{p.name}"
+                        try:
+                            tracks = await lavalink.get_tracks(query)
+                            if tracks:
+                                player.add(requester=ctx.author.id, track=tracks[0])
+                                if not player.is_playing:
+                                    await player.play()
+                                played = True
+                                break
+                        except Exception as e:
+                            log.error("Final fallback failed for %s: %s", p.name, e)
+                
+                # Restore listeners
+                if audio_cog and hasattr(audio_cog, '_listeners'):
+                    for event_name, listeners in original_listeners:
+                        audio_cog._listeners[event_name] = listeners
+                        
+            except Exception as e:
+                log.error("Listener manipulation failed: %s", e)
 
         if not played:
             log.error("All TTS playback methods failed")
-            with contextlib.suppress(Exception):
-                await ctx.send("❌ Failed to play TTS audio.")
-            return
+            # Don't send error message to avoid chat spam
 
         # Clean up files after delay
         async def delayed_cleanup():
