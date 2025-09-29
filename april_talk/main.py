@@ -1445,6 +1445,19 @@ class AprilTalk(commands.Cog):
             await ctx.send(f"✅ Temperature set to `{value}`")
         else:
             await ctx.send("❌ Value must be between 0.0 and 1.0")
+    @aprilconfig.command(name="systemprompt")
+    async def cfg_systemprompt(self, ctx: commands.Context, *, prompt: str):
+    """Set the system prompt for standard mode"""
+        await self.config.system_prompt.set(prompt)
+            preview = prompt[:200] + ("..." if len(prompt) > 200 else "")
+        await ctx.send(f"✅ System prompt updated:\n```{preview}```")
+
+    @aprilconfig.command(name="smertprompt")
+    async def cfg_smertprompt(self, ctx: commands.Context, *, prompt: str):
+    """Set the system prompt for smert mode"""
+        await self.config.smert_prompt.set(prompt)
+            preview = prompt[:200] + ("..." if len(prompt) > 200 else "")
+        await ctx.send(f"✅ Smert prompt updated:\n```{preview}```")
 
     @aprilconfig.command()
     async def tokens(self, ctx: commands.Context, num: int):
