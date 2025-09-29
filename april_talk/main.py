@@ -829,82 +829,167 @@ class AprilTalk(commands.Cog):
 
     # ---------------- Chat flow ----------------
 
-    async def process_query(self, ctx: commands.Context, input_text: str):
-        use_voice = False
-        if await self.config.tts_enabled():
-            try:
-                player = self.get_player(ctx.guild.id)
-                use_voice = player and self.is_player_connected(player)
-            except Exception:
-                use_voice = False
+async def process_query(self, ctx: commands.Context, input_text: str):
+    """Main chat processing with full history, capability awareness, and context injection"""
+    use_voice = False
+    if await self.config.tts_enabled():
+        try:
+            player = self.get_player(ctx.guild.id)
+            use_voice = player and self.is_player_connected(player)
+        except Exception:
+            use_voice = False
 
-        user_cfg = self.config.user(ctx.author)
-        smert_mode = await user_cfg.smert_mode()
+    user_cfg = self.config.user(ctx.author)
+    smert_mode = await user_cfg.smert_mode()
 
-        async with ctx.typing():
-            try:
-                ch = ctx.channel.id
-                if ch not in self.history:
-                    max_hist = await self.config.max_history()
-                    self.history[ch] = deque(maxlen=max_hist * 2)
+    async with ctx.typing():
+        try:
+            ch = ctx.channel.id
+            
+            # Initialize history for this channel if needed
+            if ch not in self.history:
+                max_hist = await self.config.max_history()
+                self.history[ch] = deque(maxlen=max_hist * 2)
+                log.debug(f"Initialized history for channel {ch} with maxlen {max_hist * 2}")
 
-                system_prompt = (await self.config.smert_prompt()) if smert_mode else (await self.config.system_prompt())
-                messages = [{"role": "system", "content": system_prompt}]
+            # Build base system prompt
+            system_prompt = (await self.config.smert_prompt()) if smert_mode else (await self.config.system_prompt())
+            messages = [{"role": "system", "content": system_prompt}]
 
-                # Loki RAG injection if asked
-                if self._looks_like_memory_request(input_text):
-                    topic = re.sub(r"^(april|hey|hi|please|can you)\s+", "", input_text, flags=re.I).strip()
-                    snippets = await self._loki_search_snippets(ctx, topic or "interesting|fact|todo|plan", since="365d", k=30)
-                    loki_context_text = await self._summarize_snippets_into_facts(ctx.author.id, snippets, goal="Provide an interesting, relevant fact this user might care about.")
+            # Inject conversation-state reminder (reinforces capability awareness)
+            history_count = len(self.history[ch])
+            if history_count > 0:
+                conv_reminder = (
+                    f"[SYSTEM STATE: You currently have {history_count} messages of conversation history available in this channel. "
+                    f"This is your active working memory. Use this context when responding. "
+                    f"When users make contextual requests like 'draw that' or 'what did they say', reference this history naturally. "
+                    f"Never claim you cannot see previous messages - you factually can and do.]"
+                )
+                messages.append({"role": "system", "content": conv_reminder})
+                log.debug(f"Injected history reminder: {history_count} messages available")
+
+            # Loki RAG injection if user is asking about distant history
+            if self._looks_like_memory_request(input_text):
+                topic = re.sub(r"^(april|hey|hi|please|can you)\s+", "", input_text, flags=re.I).strip()
+                log.debug(f"Memory request detected, searching Loki for: {topic}")
+                snippets = await self._loki_search_snippets(ctx, topic or "interesting|fact|todo|plan", since="365d", k=30)
+                if snippets:
+                    loki_context_text = await self._summarize_snippets_into_facts(
+                        ctx.author.id, 
+                        snippets, 
+                        goal="Provide relevant facts from historical logs to answer the user's question."
+                    )
                     if loki_context_text:
-                        messages.append({"role": "system", "content": f"[history-facts]\n{loki_context_text}"})
+                        messages.append({
+                            "role": "system", 
+                            "content": f"[HISTORICAL LOGS FROM LOKI - older than current conversation]\n{loki_context_text}"
+                        })
+                        log.debug(f"Injected Loki context: {len(loki_context_text)} chars")
 
-                # inject cached recall if present
-                ch_recall = self.recall.get(ch, {})
-                if ch_recall:
-                    mems = []
-                    for uname, lines in ch_recall.items():
-                        if not lines:
-                            continue
-                        subset = lines[:5]
-                        mems.append(f"{uname} recent: " + " | ".join(subset))
-                    if mems:
-                        messages.append({"role": "system", "content": "[memory] " + " || ".join(mems)})
+            # Inject cached recall if present (from manual fetch commands)
+            ch_recall = self.recall.get(ch, {})
+            if ch_recall:
+                mems = []
+                for uname, lines in ch_recall.items():
+                    if not lines:
+                        continue
+                    subset = lines[:5]
+                    mems.append(f"{uname}: " + " | ".join(subset))
+                if mems:
+                    recall_context = "[CACHED RECALL from fetch command]\n" + "\n".join(mems)
+                    messages.append({"role": "system", "content": recall_context})
+                    log.debug(f"Injected recall context for {len(ch_recall)} users")
 
-                messages.extend(self.history[ch])
-                messages.append({"role": "user", "content": input_text})
+            # **CRITICAL: Add conversation history from local cache**
+            # This gives April her working memory of the current conversation
+            history_messages = list(self.history[ch])
+            messages.extend(history_messages)
+            log.debug(f"Extended messages with {len(history_messages)} history entries")
+            
+            # Add current user message
+            messages.append({"role": "user", "content": input_text})
+            
+            # Log the full message structure for debugging (truncated)
+            log.debug(f"Message structure: {len(messages)} total messages")
+            for i, msg in enumerate(messages):
+                role = msg.get("role", "unknown")
+                content_preview = msg.get("content", "")[:100]
+                log.debug(f"  [{i}] {role}: {content_preview}...")
 
-                if smert_mode:
-                    resp = await self._with_limit(self._api_sem, self.query_anthropic(ctx.author.id, messages))
-                else:
-                    resp = await self._with_limit(self._api_sem, self.query_deepseek(ctx.author.id, messages))
+            # Get response from appropriate model
+            if smert_mode:
+                log.debug("Using Anthropic (smert mode)")
+                resp = await self._with_limit(self._api_sem, self.query_anthropic(ctx.author.id, messages))
+            else:
+                log.debug("Using DeepSeek (standard mode)")
+                resp = await self._with_limit(self._api_sem, self.query_deepseek(ctx.author.id, messages))
 
-                draw_prompt = self.maybe_extract_draw_prompt(resp)
-                clean = re.sub(r"<draw>.*?</draw>", "", resp, flags=re.IGNORECASE | re.DOTALL).strip()
+            log.debug(f"Got response: {len(resp)} chars")
 
-                self.history[ch].append({"role": "user", "content": input_text})
-                self.history[ch].append({"role": "assistant", "content": clean})
+            # Extract draw prompt if present
+            draw_prompt = self.maybe_extract_draw_prompt(resp)
+            if draw_prompt:
+                log.debug(f"Extracted draw prompt: {draw_prompt[:50]}...")
+            
+            # Clean response (remove draw tags for text display)
+            clean = re.sub(r"<draw>.*?</draw>", "", resp, flags=re.IGNORECASE | re.DOTALL).strip()
 
-                # Update conversational subject (heuristic)
-                ctxobj = self._ctx(ch)
-                m = re.search(r"([A-Z][^.!?\n]{5,60})", clean)
-                if m:
-                    ctxobj["last_subject"] = m.group(1).strip()
+            # **Save to history AFTER successful response**
+            self.history[ch].append({"role": "user", "content": input_text})
+            self.history[ch].append({"role": "assistant", "content": clean})
+            log.debug(f"Saved to history. New count: {len(self.history[ch])} messages")
 
-                tasks = []
-                if not (use_voice and not await self.config.text_response_when_voice()):
-                    tasks.append(asyncio.create_task(self.send_streamed_response(ctx, clean)))
-                if use_voice:
-                    tasks.append(asyncio.create_task(self.speak_response(ctx, clean)))
-                if draw_prompt:
-                    styled = self.style_prompt(draw_prompt)
-                    ctxobj["last_image_prompt"] = styled
-                    tasks.append(asyncio.create_task(self._render_and_send_image(ctx, styled, prefix="pic related:")))
-                if tasks:
-                    await asyncio.gather(*tasks, return_exceptions=True)
+            # Update conversational subject tracking (for contextual drawing)
+            ctxobj = self._ctx(ch)
+            
+            # Extract a subject from the response (look for capitalized phrases)
+            m = re.search(r"([A-Z][^.!?\n]{5,60})", clean)
+            if m:
+                ctxobj["last_subject"] = m.group(1).strip()
+                log.debug(f"Updated last_subject: {ctxobj['last_subject']}")
+            
+            # Also try to extract subject from user input if no subject found
+            if not ctxobj.get("last_subject"):
+                # Look for key nouns/phrases in user input
+                user_match = re.search(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b", input_text)
+                if user_match:
+                    ctxobj["last_subject"] = user_match.group(1)
+                    log.debug(f"Extracted subject from user input: {ctxobj['last_subject']}")
 
-            except Exception as e:
-                await ctx.send(f"❌ Error: {e}")
+            # Prepare output tasks (text, voice, image)
+            tasks = []
+            
+            # Text response (unless voice-only mode is enabled)
+            if not (use_voice and not await self.config.text_response_when_voice()):
+                tasks.append(asyncio.create_task(self.send_streamed_response(ctx, clean)))
+                log.debug("Scheduled text response")
+            
+            # Voice response (if in voice channel)
+            if use_voice:
+                tasks.append(asyncio.create_task(self.speak_response(ctx, clean)))
+                log.debug("Scheduled voice response")
+            
+            # Image generation (if draw tag was present)
+            if draw_prompt:
+                styled = self.style_prompt(draw_prompt)
+                ctxobj["last_image_prompt"] = styled
+                tasks.append(asyncio.create_task(
+                    self._render_and_send_image(ctx, styled, prefix="pic related:")
+                ))
+                log.debug(f"Scheduled image generation: {styled[:50]}...")
+            
+            # Execute all tasks concurrently
+            if tasks:
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                # Log any errors from concurrent tasks
+                for i, result in enumerate(results):
+                    if isinstance(result, Exception):
+                        log.error(f"Task {i} failed: {result}", exc_info=result)
+
+        except Exception as e:
+            log.error(f"Query processing error in channel {ctx.channel.id}: {e}", exc_info=True)
+            await ctx.send(f"❌ Error processing your request: {e}")
 
     async def send_streamed_response(self, ctx: commands.Context, resp: str):
         max_len = await self.config.max_message_length()
