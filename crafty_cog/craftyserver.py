@@ -544,8 +544,7 @@ class CraftyServer(commands.Cog):
                 error = body.get("error", r.status)
                 detail = body.get("error_data", "")
                 raise ValueError(
-                    f"Crafty API returned error: `{error}` — {detail}
-"
+                    f"Crafty API returned error: `{error}` - {detail}\n"
                     f"Payload sent: `{payload}`"
                 )
 
@@ -716,7 +715,8 @@ class CraftyServer(commands.Cog):
                 f"`{ctx.prefix}createserver https://www.curseforge.com/minecraft/modpacks/all-the-mods-9`\n"
                 f"`{ctx.prefix}createserver https://www.curseforge.com/minecraft/modpacks/atm9 \"ATM9\" 25570 2 8`\n\n"
                 "**Other commands:**\n"
-                f"`{ctx.prefix}listservers` — list all servers and their IDs\n"
+                f"`{ctx.prefix}listservers` — list all servers and their (maybebroke) IDs\n"
+		f"`{ctx.prefix}allservers` — List all the current servers \n\n"
                 f"`{ctx.prefix}startserver <id>` — start a server\n"
                 f"`{ctx.prefix}stopserver <id>` — stop a server\n\n"
                 "**Notes:**\n"
