@@ -245,7 +245,14 @@ class CraftyServer(commands.Cog):
             )
 
             # 3. Download zip to Crafty's import directory
-            import_path = cfg["crafty_import"]
+            import_path = cfg["crafty_import"].rstrip("/")
+            if not import_path or not os.path.isdir(import_path):
+                return await msg.edit(embed=self._embed(
+                    "❌ Import Path Invalid",
+                    f"Import path `{import_path or '(not set)'}` does not exist.\n"
+                    f"Run `{ctx.prefix}craftyset import <path>` with the correct Crafty import directory.",
+                    discord.Color.red(),
+                ))
             dest_path = os.path.join(import_path, file_name)
 
             try:
@@ -271,6 +278,7 @@ class CraftyServer(commands.Cog):
                     cfg["crafty_token"],
                     server_name=server_name,
                     zip_filename=file_name,
+                    zip_full_path=dest_path,
                     port=port,
                     min_ram=min_ram,
                     max_ram=max_ram,
@@ -375,23 +383,34 @@ class CraftyServer(commands.Cog):
 
     async def _resolve_file_download(self, session, headers, file: dict):
         """
-        Returns (download_url, filename).
-        CF sometimes returns None for downloadUrl — falls back to constructing it.
+        Returns (download_url, safe_filename).
+        Fetches the authorised download URL via the CF API (uses your API key).
+        Falls back to CDN URL construction only if the API returns nothing.
         """
-        download_url = file.get("downloadUrl")
-        file_name = file.get("fileName", "serverpack.zip")
+        file_id = file["id"]
+        raw_name = file.get("fileName", "serverpack.zip")
+
+        # Sanitise filename — strip characters that break filesystem paths
+        safe_name = re.sub(r'[^\w\-. ]', '_', raw_name).strip()
+        safe_name = safe_name.replace(" ", "_")
+
+        # Ask CF API for the authorised download URL
+        url = f"{CURSEFORGE_API}/mods/files/{file_id}/download-url"
+        async with session.get(url, headers=headers) as r:
+            if r.status == 200:
+                data = await r.json()
+                download_url = data.get("data")
+            else:
+                download_url = None
 
         if not download_url:
-            # Construct the CDN URL manually
-            file_id = file["id"]
+            # Fallback: construct CDN URL
             id_str = str(file_id)
             part1 = id_str[:4]
             part2 = id_str[4:]
-            download_url = (
-                f"https://mediafilez.forgecdn.net/files/{part1}/{part2}/{file_name}"
-            )
+            download_url = f"https://mediafilez.forgecdn.net/files/{part1}/{part2}/{raw_name}"
 
-        return download_url, file_name
+        return download_url, safe_name
 
     # -------------------------------------------------------------------------
     # Download helper
@@ -436,6 +455,44 @@ class CraftyServer(commands.Cog):
     # Crafty API helpers
     # -------------------------------------------------------------------------
 
+    @staticmethod
+    def _find_jarfile(zip_path: str) -> tuple:
+        """
+        Inspect the zip and return (archive_internal_path, jarfile).
+        Looks for common modpack server jar names.
+        Falls back to any .jar found at root or one level deep.
+        """
+        import zipfile
+        JAR_PRIORITY = [
+            "forge", "fabric-server-launch", "quilt-server-launch",
+            "neoforge", "server", "minecraft_server", "paper", "spigot",
+        ]
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            names = zf.namelist()
+
+        # Collect all .jar files
+        jars = [n for n in names if n.endswith(".jar") and "__MACOSX" not in n]
+
+        if not jars:
+            return "", "server.jar"  # best guess fallback
+
+        # Score by priority keywords
+        def score(path):
+            lower = path.lower()
+            for i, kw in enumerate(JAR_PRIORITY):
+                if kw in lower:
+                    return i
+            return len(JAR_PRIORITY)
+
+        jars.sort(key=score)
+        best = jars[0]
+
+        # Split into (folder, filename)
+        parts = best.rsplit("/", 1)
+        if len(parts) == 2:
+            return parts[0] + "/", parts[1]
+        return "", best
+
     async def _crafty_create_server(
         self,
         session: aiohttp.ClientSession,
@@ -443,14 +500,17 @@ class CraftyServer(commands.Cog):
         token: str,
         server_name: str,
         zip_filename: str,
+        zip_full_path: str,
         port: int,
         min_ram: int,
         max_ram: int,
     ):
         """
-        POST /api/v2/servers with import_zip create type.
+        POST /api/v2/servers using import_server create type (zip import).
         Returns (server_id, server_uuid).
         """
+        archive_internal_path, jarfile = self._find_jarfile(zip_full_path)
+
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
@@ -465,14 +525,14 @@ class CraftyServer(commands.Cog):
             },
             "create_type": "minecraft_java",
             "minecraft_java_create_data": {
-                "create_type": "import_zip",
-                "import_zip_create_data": {
-                    "zip": zip_filename,
-                    "zip_root": "/",
-                    "agree_to_eula": False,
-                    "server_properties_port": port,
+                "create_type": "import_server",
+                "import_server_create_data": {
+                    "archive_name": zip_filename,
+                    "archive_internal_path": archive_internal_path,
+                    "jarfile": jarfile,
                     "mem_min": min_ram,
                     "mem_max": max_ram,
+                    "server_properties_port": port,
                 },
             },
         }
@@ -483,7 +543,11 @@ class CraftyServer(commands.Cog):
             if r.status not in (200, 201) or body.get("status") != "ok":
                 error = body.get("error", r.status)
                 detail = body.get("error_data", "")
-                raise ValueError(f"Crafty API returned error: `{error}` — {detail}")
+                raise ValueError(
+                    f"Crafty API returned error: `{error}` — {detail}
+"
+                    f"Payload sent: `{payload}`"
+                )
 
         server_uuid = body["data"].get("new_server_uuid") or body["data"].get("new_server_id")
         server_id = body["data"].get("new_server_id", server_uuid)
