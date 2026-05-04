@@ -94,8 +94,11 @@ class CraftyServer(commands.Cog):
     async def set_token(self, ctx, token: str):
         """Set the Crafty superuser API token."""
         await self.config.crafty_token.set(token)
-        await ctx.message.delete()
-        await ctx.send("Token saved. (Message deleted for security.)", delete_after=5)
+        try:
+            await ctx.message.delete()
+            await ctx.send("Token saved. (Message deleted for security.)", delete_after=5)
+        except Exception:
+            await ctx.send("Token saved. (Give me Manage Messages so I can delete that.)", delete_after=5)
 
     @craftyset.command(name="import")
     async def set_import(self, ctx, path: str):
@@ -109,8 +112,11 @@ class CraftyServer(commands.Cog):
     async def set_cfkey(self, ctx, key: str):
         """Set your CurseForge API key."""
         await self.config.cf_api_key.set(key)
-        await ctx.message.delete()
-        await ctx.send("CF API key saved. (Message deleted for security.)", delete_after=5)
+        try:
+            await ctx.message.delete()
+            await ctx.send("CF API key saved. (Message deleted for security.)", delete_after=5)
+        except Exception:
+            await ctx.send("CF API key saved. (Give me Manage Messages so I can delete that.)", delete_after=5)
 
     @craftyset.command(name="ram")
     async def set_ram(self, ctx, min_gb: int, max_gb: int):
@@ -495,7 +501,7 @@ class CraftyServer(commands.Cog):
     # Server list / start / stop
     # -------------------------------------------------------------------------
 
-    @commands.command(name="listservers", aliases=["allservers"])
+    @commands.command(name="allservers")
     @commands.guild_only()
     async def list_servers(self, ctx: commands.Context):
         """List all servers registered in Crafty."""
