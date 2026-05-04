@@ -495,7 +495,7 @@ class CraftyServer(commands.Cog):
     # Server list / start / stop
     # -------------------------------------------------------------------------
 
-    @commands.command(name="listservers", aliases=["servers"])
+    @commands.command(name="listservers", aliases=["allservers"])
     @commands.guild_only()
     async def list_servers(self, ctx: commands.Context):
         """List all servers registered in Crafty."""
