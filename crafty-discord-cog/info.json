@@ -1,0 +1,13 @@
+{
+    "author": ["Rezyn"],
+    "description": "Creates Minecraft servers in Crafty Controller from a CurseForge modpack link.",
+    "end_user_data_statement": "No user data is stored.",
+    "hidden": false,
+    "install_msg": "Use `[p]craftyset` to configure the cog before use.",
+    "name": "CraftyServer",
+    "required_cogs": {},
+    "requirements": ["aiofiles"],
+    "short": "Create Crafty servers from CurseForge links.",
+    "tags": ["minecraft", "crafty", "curseforge", "server"],
+    "min_bot_version": "3.5.0"
+}
