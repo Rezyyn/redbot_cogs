@@ -1,5 +1,5 @@
 {
-    "name": "AMPServers",
+    "name": "AMPServers controller",
     "short": "List and control game servers on a CubeCoders AMP panel.",
     "description": "Connects to a CubeCoders AMP (Application Management Panel) instance via its JSON API. Lists all game server instances with live status, player counts, CPU and memory metrics. Admins and allowed roles can start, stop and restart instances from Discord.",
     "author": ["Rezyn"],
