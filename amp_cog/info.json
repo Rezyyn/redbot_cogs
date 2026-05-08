@@ -1,12 +1,13 @@
 {
-    "name": "AMPServers controller",
-    "short": "List and control game servers on a CubeCoders AMP panel.",
-    "description": "Connects to a CubeCoders AMP (Application Management Panel) instance via its JSON API. Lists all game server instances with live status, player counts, CPU and memory metrics. Admins and allowed roles can start, stop and restart instances from Discord.",
     "author": ["Rezyn"],
-    "install_msg": "Set your AMP panel details with `[p]ampset url`, `[p]ampset username`, and `[p]ampset password` (run the password command in a DM). Optionally set `[p]ampset public_ip` to show a connect address in server details.",
-    "requirements": [],
-    "tags": ["gameservers", "amp", "cubecoders", "hosting"],
-    "min_bot_version": "3.5.0",
+    "description": "Creates  servers in AMP Controller",
+    "end_user_data_statement": "No user data is stored.",
     "hidden": false,
-    "disabled": false
+    "install_msg": "Use `[p]AMPset` to configure the cog before use.",
+    "name": "AMPServer",
+    "required_cogs": {},
+    "requirements": ["aiofiles"],
+    "short": "Create AMP servers from CurseForge links.",
+    "tags": ["minecraft", "AMP", "curseforge", "server"],
+    "min_bot_version": "3.5.0"
 }
