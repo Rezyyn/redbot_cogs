@@ -1,0 +1,10 @@
+{
+    "name": "AprilX",
+    "short": "Ollama-backed roleplay chat cog with multi-provider fallback.",
+    "description": "Separate chat cog using a locally hosted Ollama model. Commands under `aprilx`. Also supports DeepSeek, OpenAI, and Anthropic as provider overrides. No TTS, no images, no Loki — pure chat.",
+    "author": ["Rezyyn"],
+    "install_msg": "Load with `[p]load april_x`. Configure Ollama URL and model with `[p]aprilxcfg ollamaurl` and `[p]aprilxcfg ollamamodel`. Test connectivity with `[p]aprilxcfg ollamatest`.",
+    "required_cogs": {},
+    "requirements": [],
+    "tags": ["chat", "ai", "ollama", "roleplay"]
+}

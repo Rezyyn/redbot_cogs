@@ -213,6 +213,42 @@ class StreamController(commands.Cog):
         else:
             await ctx.send(f"❌ {resp.get('error')}")
 
+    @stream.command(name="invite")
+    @checks.mod_or_permissions(manage_guild=True)
+    async def stream_invite(self, ctx, url: str):
+        """
+        Make the streaming account join a Discord server via invite.
+
+        Example: !stream invite discord.gg/xxxx
+        """
+        resp = await self._send_daemon({"action": "accept_invite", "url": url})
+        await ctx.send(resp.get("message") or ("✅ Done" if resp.get("ok") else f"❌ {resp.get('error')}"))
+
+    @stream.command(name="dms")
+    @checks.admin()
+    async def stream_dms(self, ctx):
+        """Show the last 50 DMs received by the streaming account."""
+        resp = await self._send_daemon({"action": "get_dms"})
+        if not resp.get("ok"):
+            return await ctx.send(f"❌ {resp.get('error')}")
+
+        dms = resp.get("dms", [])
+        if not dms:
+            return await ctx.send("📭 No DMs received yet.")
+
+        lines = []
+        for dm in reversed(dms[-20:]):  # Show last 20, newest first
+            ts = dm["timestamp"][:16].replace("T", " ")
+            lines.append(f"`{ts}` **{dm['author']}**: {dm['content'][:80]}")
+
+        e = discord.Embed(
+            title="📬 Streaming Account DMs",
+            description="\n".join(lines),
+            color=discord.Color.blurple(),
+        )
+        e.set_footer(text="Last 20 of up to 50 buffered • resets on daemon restart")
+        await ctx.send(embed=e)
+
     @stream.command(name="stop")
     async def stream_stop(self, ctx):
         """Stop the current stream and disconnect from voice."""
