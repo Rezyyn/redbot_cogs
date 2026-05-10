@@ -264,6 +264,8 @@ class StreamController(commands.Cog):
     @stream.command(name="status")
     async def stream_status(self, ctx):
         """Show current stream status."""
+        if not ctx.guild:
+            return await ctx.send("❌ Run this in a server, not a DM.")
         resp = await self._send_daemon({"action": "status"})
 
         if not resp.get("ok"):
